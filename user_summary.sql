@@ -1,25 +1,51 @@
-select unique_mem_id, yr_week,
-       SUM(CASE WHEN transaction_base_type = 'credit' THEN 1 ELSE 0 END) as num_credit_transactions,
-       SUM(CASE WHEN transaction_base_type = 'debit' THEN 1 ELSE 0 END) as num_debit_transactions,
-       SUM(CASE WHEN transaction_base_type = 'credit' THEN amount ELSE 0 END) as total_inflows,
-       SUM(CASE WHEN transaction_base_type = 'debit' THEN amount ELSE 0 END) as total_outflows,
-       num_credit_transactions + num_debit_transactions as num_transactions,
-       SUM(CASE WHEN transaction_category_name = 'Mortgage' THEN amount ELSE 0 END) as mortgage,
-       SUM(CASE WHEN transaction_category_name = 'Rent' THEN amount ELSE 0 END) as rent,
-       AVG(user_score) as avg_user_score,
-       SUM(CASE WHEN transaction_category_name IN ('Retirement Contributions', 'Securities Trades', 'Deposits', 'Savings', 'Transfers') THEN amount ELSE 0 END) as savings,
-       SUM(CASE WHEN transaction_category_name = 'Credit Card Payments' THEN amount ELSE 0 END) as credit_card_payment,
-       SUM(CASE WHEN transaction_category_name IN ('Mortgage', 'Rent', 'Home Improvement', 'Automotive', 'Transfers') THEN amount ELSE 0 END) as durables,
-       SUM(CASE WHEN transaction_category_name IN ('Pet Care', 'Office Expenses', 'Charitable Giving', 'Cable/Satellite/Telecom', 'Personal/Family',
-                                                   'Electronics', 'Other', 'Subscriptions', 'Travel', 'Insurance', 'Healthcare', 'ATM/Cash Withdrawals',
-                                                   'Groceries', 'Entertainment', 'Restaurants') THEN amount ELSE 0 END) as nondurables,
-       SUM(CASE WHEN description ilike '%Overdraft%' THEN 1 ELSE 0 END) as num_overdraft
-from(
-        select *, CONCAT(date_part(year, optimized_transaction_date),date_part(week, optimized_transaction_date)) as yr_week
-        from temp_132.bankhquser_sample
-        WHERE unique_mem_id IN (SELECT unique_mem_id FROM temp_132.federalemployees_subsamplesalary
-                                                     UNION ALL SELECT unique_mem_id FROM temp_132.stateemployees_subsamplesalary)) sub
-GROUP BY unique_mem_id, yr_week
+create table temp_132.oneperc_combo as(
+(select a.unique_mem_id, a.optimized_transaction_date, a.transaction_base_type, a.transaction_category_name,
+                             a.amount, 'bank' as source
+from temp_132.onepercsample a inner join temp_132.payroll_ids b
+on a.unique_mem_id = b.unique_mem_id)
+UNION ALL
+(select a.unique_mem_id,
+        a.optimized_transaction_date,
+        a.transaction_base_type,
+        a.transaction_category_name,
+        a.amount,
+        'card' as source
+ from temp_132.onepercsample_card a
+          inner join temp_132.payroll_ids b on a.unique_mem_id = b.unique_mem_id))
+
+create table temp_132.user_history as (
+select a.*
+from (select unique_mem_id, min(optimized_transaction_date) as min_date,
+             max(optimized_transaction_date) as max_date, count(*) as n_transactions
+from yi_xpanelov6_20220816.bank_panel
+where mod(unique_mem_id,100) = 1
+group by unique_mem_id) a
+inner join temp_132.payroll_ids b
+on a.unique_mem_id = b.unique_mem_id)
 
 
+select unique_mem_id, yr_week, transaction_base_type, transaction_category_name, sum(amount) as category_amt,
+       case
+           when transaction_category_name in
+                ('Deposits', 'Insurance', 'Retirement Contributions', 'Savings', 'Securities Trades', 'Transfers')
+               then 'savings/investment'
+           when transaction_category_name in ('Automotive/Fuel')
+               then 'auto'
+           when transaction_category_name in ('Mortgage', 'Rent', 'Home Improvement', 'Utilities')
+               then 'housing'
+           when transaction_category_name in ('Education')
+               then 'education'
+           when transaction_category_name in ('Credit Card Payments', 'Loans')
+               then 'debtpaydown'
+           when transaction_category_name in
+                ('ATM/Cash Withdrawals', 'Cable/Satellite/Telecom', 'Charitable Giving',
+                 'Electronics/General Merchandise',
+                 'Entertainment/Recreation', 'Gifts', 'Groceries', 'Healthcare/Medical', 'Insurance', 'Office Expenses',
+                 'Personal/Family', 'Pet Care', 'Postage/Shipping',
+                 'Restaurants', 'Rewards', 'Services/Supplies', 'Subscriptions', 'Travel')
+               then 'nondurables'
+           else 'other' end                                                         as agg_category
+from  (select *, CONCAT(date_part(year, optimized_transaction_date),date_part(week, optimized_transaction_date)) as yr_week
+        from temp_132.oneperc_combo)
+group by unique_mem_id, yr_week, transaction_base_type, transaction_category_name
 

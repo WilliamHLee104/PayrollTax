@@ -21,6 +21,13 @@ CREATE TABLE temp_132.onepercsample AS (SELECT *
                                         WHERE mod(unique_mem_id, 100) = 1
                                           AND optimized_transaction_date >= '2018-08-01')
 
+-- Create 1% card sample and store in temp directory
+CREATE TABLE temp_132.onepercsample_card AS (SELECT *
+                                        FROM yi_xpanelov6_20220816.card_panel
+                                        WHERE mod(unique_mem_id, 100) = 1
+                                          AND optimized_transaction_date >= '2018-08-01')
+
+
 -- Count Users/Transactions in the 1% sample
 select count(distinct unique_mem_id) as num_users,
        count(distinct unique_bank_account_id),
@@ -55,6 +62,7 @@ from temp_132.filter1
 
 
 -- Find all Qualifying Federal/State/Local Payroll Transactions
+create table temp_132.payroll as (
 select *
 from (select *,
              CASE
@@ -152,11 +160,11 @@ from (select *,
                      AND primary_merchant_name not ilike '%USPS%'
                      AND primary_merchant_name not ilike '%LOUISIANA%'
                      AND primary_merchant_name not ilike '%ACCO BRANDS%'
-                     AND primary_merchant_name not ilike '%KEYPOINT GOVERNMENT SOLUTIONS%'
+                     AND primary_merchant_name not ilike '%GOVERNMENT SOLUTIONS%'
                      AND primary_merchant_name not ilike '%ASCENSUS TRUST%'
                      AND primary_merchant_name not ilike '%US NAVY NSA PC MORALE WELFARE & RECREATION%'
                      AND primary_merchant_name not ilike '%SOCIAL SEC%'
-                     AND primary_merchant_name not ilike '%NATIONAL GOVERNMENT SERVICES%'
+                     AND primary_merchant_name not ilike '%GOVERNMENT SERVICES%'
                      AND primary_merchant_name not ilike '%FEDERAL RESERVE%') THEN 'federal'
                  WHEN ((upper(primary_merchant_name) like '%STATE TREASUR%' or
                         upper(primary_merchant_name) like '%STATE COMPTROL%' or
@@ -272,5 +280,12 @@ from (select *,
         and transaction_category_name = 'Salary/Regular Income'
         and amount > 500
         and is_duplicate = 0)
-where fed not like 'other'
+where fed not like 'other')
+
+create table temp_132.payroll_ids as (
+select distinct unique_mem_id
+from temp_132.payroll
+where fed <> 'other')
+
+
 

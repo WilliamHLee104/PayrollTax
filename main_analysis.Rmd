@@ -1,0 +1,36 @@
+---
+title: "Main Analysis"
+author: "William Lee"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+  toc: true
+  toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+
+xfun::pkg_attach2('tidyverse', 'readxl', 'stats', 'sandwich', 'lmtest', 'ivreg', 'knitr', 
+                  'lubridate', 'data.table', 'kableExtra')
+
+options(dplyr.summarise.inform = FALSE)
+
+proj <- dirname(rstudioapi::getSourceEditorContext()$path)
+
+```
+
+## Introdution
+
+The following is the second document in a series analyzing the 2020 Payroll Tax Deferral Program. In the first document, titled "User_Count", I proposed a classification scheme to determine which workers are eligible for the tax deferral and discussed limitations of the data. This document present preliminary results on the payroll tax deferral.  
+
+## Covariate Comparison
+
+## Daily Outcome Variables
+
+## Weekly/Monthly Outcome Variables
+
+

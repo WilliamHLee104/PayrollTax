@@ -27,10 +27,35 @@ proj <- dirname(rstudioapi::getSourceEditorContext()$path)
 
 The following is the second document in a series analyzing the 2020 Payroll Tax Deferral Program. In the first document, titled "User_Count", I proposed a classification scheme to determine which workers are eligible for the tax deferral and discussed limitations of the data. This document present preliminary results on the payroll tax deferral.  
 
-## Covariate Comparison
+## Parallel Trends by Category (Simple Eyeball Econometrics)
 
-## Daily Outcome Variables
+```{r cov, echo = F, fig.height=10, fig.width=12}
 
-## Weekly/Monthly Outcome Variables
+category_weekly <- fread(file.path(proj, 'rawdata', 'category_weekly.csv')) %>% 
+  mutate(yr_week_start = ymd("2020-01-01") + lubridate::weeks(yr_week)) %>% 
+  mutate(fed = case_when(fed == 'federal' ~ 'fed', TRUE ~ 'state/local'),
+         elig = case_when(elig ~ "elig", TRUE ~ 'inelig'),
+         fed_elig = paste0(fed, "-",elig))
+
+
+parallel_trends <- function(categories){
+  category_weekly %>% 
+  filter(transaction_category_name %in% categories & fed_elig != 'state/local-inelig') %>% 
+  group_by(unique_mem_id, fed_elig , transaction_category_name) %>% 
+  mutate(scaled_amt = category_amt/mean(category_amt, na.rm = T)) %>% 
+  group_by(fed_elig, transaction_category_name, yr_week_start) %>% 
+  summarize(scaled_amt = mean(scaled_amt, na.rm = T)) %>% 
+  ggplot(aes(x = yr_week_start, y = scaled_amt, color = fed_elig)) +
+  geom_smooth(method = 'loess', se = F) +
+  #geom_point() +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  facet_wrap(.~ transaction_category_name, ncol = 2, scales = 'free')
+}
+
+parallel_trends(c("Automotive/Fuel", "Deposits", "Rent", "Mortgage", "Salary/Regular Income"))
+
+
+```
 
 

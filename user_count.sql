@@ -2,67 +2,73 @@
 select count(distinct unique_mem_id) as num_users
 from yi_xpanelov6_20220816.bank_panel
 
--- Count By Month (saved to count_by_month.csv)
-select count(distinct unique_mem_id) as num_users, count(*) as num_transactions, month
-from (select substring(optimized_transaction_date, 1, 7) as month, unique_mem_id
-      from yi_xpanelov6_20220816.bank_panel) as month_create
-GROUP BY month
-ORDER BY month
+select count(distinct unique_mem_id) as num_users
+from yi_xpanelov6_20220816.card_panel
 
--- Checking if IDs are truly random. They are
-select count(*), enddigits
-from (select mod(unique_mem_id, 100) as enddigits from yi_xpanelov6_20220816.bank_panel)
-GROUP BY enddigits
-ORDER BY enddigits
-
--- Create 1% sample and store in my temp directory
-CREATE TABLE temp_132.onepercsample AS (SELECT *
+-- Create sample and store in my temp directory
+CREATE TABLE temp_132.sample AS (SELECT *
                                         FROM yi_xpanelov6_20220816.bank_panel
-                                        WHERE mod(unique_mem_id, 100) = 1
-                                          AND optimized_transaction_date >= '2018-08-01')
+                                        WHERE mod(unique_mem_id, 100) < 5
+                                          AND optimized_transaction_date >= '2019-08-01'
+                                            AND is_duplicate = 0)
 
--- Create 1% card sample and store in temp directory
-CREATE TABLE temp_132.onepercsample_card AS (SELECT *
+
+-- Create card sample and store in temp directory
+CREATE TABLE temp_132.sample_card AS (SELECT *
                                         FROM yi_xpanelov6_20220816.card_panel
-                                        WHERE mod(unique_mem_id, 100) = 1
-                                          AND optimized_transaction_date >= '2018-08-01')
+                                        WHERE mod(unique_mem_id, 100) < 5
+                                          AND optimized_transaction_date >= '2019-08-01'
+                                        AND is_duplicate = 0)
+
+-- Count By Month (saved to count_by_month.csv)
+(select count(distinct unique_mem_id) as num_users, count(distinct unique_bank_account_id) as num_accounts,
+       count(*) as num_transactions, 'bank' as source, month
+from (select substring(optimized_transaction_date, 1, 7) as month, unique_mem_id, unique_bank_account_id
+      from yi_xpanelov6_20220816.bank_panel WHERE mod(unique_mem_id, 100) = 1 ) as month_create
+GROUP BY month
+ORDER BY month)
+UNION ALL
+(select count(distinct unique_mem_id) as num_users, count(distinct unique_card_account_id) as num_accounts,
+       count(*) as num_transactions, 'card' as source, month
+from (select substring(optimized_transaction_date, 1, 7) as month, unique_mem_id, unique_card_account_id
+      from yi_xpanelov6_20220816.card_panel WHERE mod(unique_mem_id, 100) = 1) as month_create
+GROUP BY month
+ORDER BY month)
 
 
--- Count Users/Transactions in the 1% sample
+
+-- Count Users/Transactions in the sample
 select count(distinct unique_mem_id) as num_users,
        count(distinct unique_bank_account_id),
        count(*)                      as num_transactions
-from temp_132.onepercsample
+FROM yi_xpanelov6_20220816.bank_panel
+WHERE mod(unique_mem_id, 100) < 5
+  AND optimized_transaction_date >= '2019-08-01'
+  AND is_duplicate = 0
 
 -- User Score Dist (saved to user_score_dist.csv)
 select unique_mem_id, avg(user_score), min(user_score), max(user_score), count(*)
-from temp_132.onepercsample
-where optimized_transaction_date >= '2020-01-01'
+FROM yi_xpanelov6_20220816.bank_panel
+WHERE mod(unique_mem_id, 100) < 5
+  AND is_duplicate = 0
+  AND optimized_transaction_date >= '2020-01-01'
   AND optimized_transaction_date < '2020-02-01'
 group by unique_mem_id
 
 
--- Filter By User Score
--- NB: Next round of filtering uses filter1 as a base table
-create table temp_132.filter1 as (SELECT b.*
-                                  from (select unique_mem_id,
-                                               avg(user_score)                                  as avg,
-                                               min(user_score)                                  as min,
-                                               substring(min(optimized_transaction_date), 1, 7) as min_month,
-                                               substring(max(optimized_transaction_date), 1, 7) as max_month
-                                        from temp_132.onepercsample
-                                        group by unique_mem_id) a
-                                           inner join temp_132.onepercsample b
-                                                      on a.unique_mem_id = b.unique_mem_id
-                                  where avg > 6.5)
+-- Filter 1 (By User Score)
+create table temp_132.filter1 as (SELECT b.*, a.avg_user_score
+                 from (select unique_mem_id,
+                              avg(user_score) as avg_user_score
+                       from temp_132.sample
+                       group by unique_mem_id) a
+                          inner join (select *
+                                      from temp_132.sample) b
+                                     on a.unique_mem_id = b.unique_mem_id
+                 where avg_user_score > 6.5)
 
-
-select count(distinct unique_mem_id)
-from temp_132.filter1
-
-
--- Find all Qualifying Federal/State/Local Payroll Transactions
-create table temp_132.payroll as (
+-- Filter 2:Find all Qualifying Federal/State/Local Payroll Transactions
+create table temp_132.filter2 as (
 select *
 from (select *,
              CASE
@@ -157,7 +163,6 @@ from (select *,
                      AND description not ilike '%DOEP TREAS%'
                      AND description not ilike '%DFEC TREAS 310%'
                      AND primary_merchant_name not ilike '%COUNTY%'
-                     AND primary_merchant_name not ilike '%USPS%'
                      AND primary_merchant_name not ilike '%LOUISIANA%'
                      AND primary_merchant_name not ilike '%ACCO BRANDS%'
                      AND primary_merchant_name not ilike '%GOVERNMENT SOLUTIONS%'
@@ -278,14 +283,212 @@ from (select *,
       from temp_132.filter1
       where transaction_base_type = 'credit'
         and transaction_category_name = 'Salary/Regular Income'
-        and amount > 500
-        and is_duplicate = 0)
+        and amount > 500) a
 where fed not like 'other')
 
-create table temp_132.payroll_ids as (
-select distinct unique_mem_id
-from temp_132.payroll
-where fed <> 'other')
+
+
+-- Calculate Share of Outside Income (returns a df of ids, total_income, qualifying_income, gov_ratio)
+create table temp_132.filter3 as (
+with filter3_totalincome as (select unique_mem_id, sum(amount) as total_income
+                             from temp_132.sample
+                             where transaction_base_type = 'credit'
+                               and amount > 0
+                               and transaction_category_name in
+                                   ('Interest Income', 'Other Income',
+                                    'Salary/Regular Income',
+                                    'Sales/Services Income')
+                             group by unique_mem_id),
+     filter3_qualifyingincome as (select unique_mem_id, sum(amount) as qualifying_income
+                                  from temp_132.filter2
+                                  group by unique_mem_id),
+     filter3_merge as (select a.unique_mem_id,
+                              b.total_income,
+                              a.qualifying_income,
+                              a.qualifying_income * 100 / b.total_income as gov_income_ratio
+                       from filter3_qualifyingincome a
+                                inner join filter3_totalincome b
+                                           on a.unique_mem_id = b.unique_mem_id
+                       where gov_income_ratio >= 80) -- This is the threshold
+select *
+from filter3_merge)
+
+
+-- Filters 4 - 7 (Single Employer, Single Classification, Regular Intervals, Income Thresholds, Limited Volatility, Credit Card Match)
+
+-- Single employer and single classification
+create table temp_132.filter7 as (with nemployers as (select unique_mem_id,
+                                                             count(distinct primary_merchant_name) as n_employers,
+                                                             count(distinct fed)                   as n_classification
+                                                      from temp_132.filter2
+                                                      group by unique_mem_id
+                                                      having n_employers = 1 -- one employer the whole time (as determined by merchant name)
+                                                         and n_classification = 1 -- never switch from fed to state of vice verse
+),
+                                       payfreq as ( -- Payfrequency and volatility
+                                           select unique_mem_id,
+                                                  median(pay_freq)                   as median_pay_freq,
+                                                  count(*)                           as n_paychecks,
+                                                  stddev(amount) * 100 / avg(amount) as paycheck_vol
+                                           from (select *,
+                                                        lead(optimized_transaction_date) over
+                                                            (partition by unique_mem_id order by optimized_transaction_date) -
+                                                        filter2.optimized_transaction_date as pay_freq
+                                                 from temp_132.filter2) a
+                                           group by unique_mem_id
+                                           having n_paychecks > 1
+                                              and median_pay_freq >= 1
+                                              and n_paychecks >= 900 / NULLIF(median_pay_freq, 0) -- required number of paychecks, roughly 3 years of paychecks)
+                                              and paycheck_vol <= 35),
+                                       elig as (select unique_mem_id,
+                                                       sum(case
+                                                               when optimized_transaction_date < '2020-09-01' and
+                                                                    optimized_transaction_date >= '2019-09-01'
+                                                                   then amount
+                                                               else 0 end) as annual_income,
+                                                       sum(case
+                                                               when optimized_transaction_date < '2020-09-01' and
+                                                                    optimized_transaction_date >= '2020-08-01'
+                                                                   then amount
+                                                               else 0 end) as monthly_income,
+                                                       case
+                                                           when annual_income > 104000 or monthly_income * 12 > 104000
+                                                               then 'inelig'
+                                                           else 'elig' end as elig
+                                                from temp_132.filter2
+                                                group by unique_mem_id
+                                                having annual_income >= 30000
+                                                   and monthly_income * 12 >= 30000),
+                                       cardmatch as (select a.unique_mem_id, -- Must match card paydowns
+                                                            a.paydown_from_bank,
+                                                            b.paydown_from_card,
+                                                            b.paydown_from_card * 100 / a.paydown_from_bank as card_perc_observed
+                                                     from (select unique_mem_id, sum(amount) as paydown_from_bank
+                                                           from temp_132.sample
+                                                           where transaction_base_type = 'debit'
+                                                             and transaction_category_name = 'Credit Card Payments'
+                                                           group by unique_mem_id) a
+                                                              inner join (select unique_mem_id, sum(amount) as paydown_from_card
+                                                                          from temp_132.sample_card
+                                                                          where transaction_base_type = 'credit'
+                                                                            and transaction_category_name = 'Credit Card Payments'
+                                                                          group by unique_mem_id) b
+                                                                         on a.unique_mem_id = b.unique_mem_id
+                                                     where card_perc_observed >= 80
+                                                       and card_perc_observed <= 120)
+                                  select nemployers.*,
+                                         median_pay_freq,
+                                         n_paychecks,
+                                         paycheck_vol,
+                                         annual_income,
+                                         monthly_income,
+                                         elig,
+                                         paydown_from_card,
+                                         paydown_from_bank,
+                                         card_perc_observed,
+                                         total_income,
+                                         qualifying_income,
+                                         gov_income_ratio
+                                  from nemployers
+                                           inner join payfreq on nemployers.unique_mem_id = payfreq.unique_mem_id
+                                           inner join elig on payfreq.unique_mem_id = elig.unique_mem_id
+                                           inner join cardmatch on elig.unique_mem_id = cardmatch.unique_mem_id
+                                           inner join temp_132.filter3
+                                                      on cardmatch.unique_mem_id = temp_132.filter3.unique_mem_id)
+
+-- Put it all together
+-- drop table temp_132.final drop table temp_132.final_card
+
+create table temp_132.final as (select sample.*, median_pay_freq,
+                                         n_paychecks,
+                                         paycheck_vol,
+                                         annual_income,
+                                         monthly_income,
+                                         elig,
+                                         paydown_from_card,
+                                         paydown_from_bank,
+                                         card_perc_observed,
+                                         total_income,
+                                         qualifying_income,
+                                         gov_income_ratio, fed,
+                                         case when (sum(case when fed = 'federal' then 1 else 0 end) over (partition by sample.unique_mem_id)) >= 1 then 'federal' else 'other' end as ever_fed
+                                from temp_132.filter7
+                                         inner join temp_132.sample on filter7.unique_mem_id = sample.unique_mem_id
+                                         left join (select unique_bank_transaction_id, fed from temp_132.filter2) b
+                                             on sample.unique_bank_transaction_id = b.unique_bank_transaction_id)
+
+-- Put it all together for card file
+create table temp_132.final_card as (
+select sample_card.*, median_pay_freq,
+                                         n_paychecks,
+                                         paycheck_vol,
+                                         annual_income,
+                                         monthly_income,
+                                         elig,
+                                         paydown_from_card,
+                                         paydown_from_bank,
+                                         card_perc_observed,
+                                         total_income,
+                                         qualifying_income,
+                                         gov_income_ratio, fed,
+                                         ever_fed
+from temp_132.filter7
+inner join (select unique_mem_id, fed, case when (sum(case when fed = 'federal' then 1 else 0 end) over (partition by unique_mem_id)) >= 1 then 'federal' else 'other' end as ever_fed from temp_132.filter2 group by unique_mem_id, fed) b
+    on filter7.unique_mem_id = b.unique_mem_id
+left join temp_132.sample_card on b.unique_mem_id = sample_card.unique_mem_id)
+
+select *
+from temp_132.final_card
+limit 10
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

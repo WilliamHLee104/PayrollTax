@@ -8,54 +8,272 @@ output:
   toc_depth: 3
 ---
 
-```{r setup, include=FALSE}
+```{r setup, include=FALSE, warning = FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
 rm(list = ls())
 
 
 xfun::pkg_attach2('tidyverse', 'readxl', 'stats', 'sandwich', 'lmtest', 'ivreg', 'knitr', 
-                  'lubridate', 'data.table', 'kableExtra')
+                  'lubridate', 'data.table', 'kableExtra', 'rJava', 'RJDBC', 'fixest')
 
 options(dplyr.summarise.inform = FALSE)
 
 proj <- dirname(rstudioapi::getSourceEditorContext()$path)
 
+
+
 ```
+
+
 
 ## Introdution
 
 The following is the second document in a series analyzing the 2020 Payroll Tax Deferral Program. In the first document, titled "User_Count", I proposed a classification scheme to determine which workers are eligible for the tax deferral and discussed limitations of the data. This document present preliminary results on the payroll tax deferral.  
 
-## Parallel Trends by Category (Simple Eyeball Econometrics)
 
-```{r cov, echo = F, fig.height=10, fig.width=12}
-
-category_weekly <- fread(file.path(proj, 'rawdata', 'category_weekly.csv')) %>% 
-  mutate(yr_week_start = ymd("2020-01-01") + lubridate::weeks(yr_week)) %>% 
-  mutate(fed = case_when(fed == 'federal' ~ 'fed', TRUE ~ 'state/local'),
-         elig = case_when(elig ~ "elig", TRUE ~ 'inelig'),
-         fed_elig = paste0(fed, "-",elig))
+I'm working with the full set of restrictions on who is counted as an eligible federal employee. The number of individuals is small here (1497 federal-eligible, 200 federal-ineligible, 129-state/local eligible, 6 state/local ineligible ). Even with the very restrictive definition, some of the key variables like paycheck frequency and amount show a high amount of variability. 
 
 
-parallel_trends <- function(categories){
-  category_weekly %>% 
-  filter(transaction_category_name %in% categories & fed_elig != 'state/local-inelig') %>% 
-  group_by(unique_mem_id, fed_elig , transaction_category_name) %>% 
-  mutate(scaled_amt = category_amt/mean(category_amt, na.rm = T)) %>% 
-  group_by(fed_elig, transaction_category_name, yr_week_start) %>% 
-  summarize(scaled_amt = mean(scaled_amt, na.rm = T)) %>% 
-  ggplot(aes(x = yr_week_start, y = scaled_amt, color = fed_elig)) +
-  geom_smooth(method = 'loess', se = F) +
-  #geom_point() +
-  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
-  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
-  facet_wrap(.~ transaction_category_name, ncol = 2, scales = 'free')
-}
 
-parallel_trends(c("Automotive/Fuel", "Deposits", "Rent", "Mortgage", "Salary/Regular Income"))
+```{r load, echo = F}
+file.paths <- list(file.path(proj, 'rawdata', 'finalp1.csv'),
+                   file.path(proj, 'rawdata', 'finalp2.csv'), 
+                   file.path(proj, 'rawdata', 'finalp3.csv'),
+                   file.path(proj, 'rawdata', 'finalp4.csv'))
+
+final <- lapply(file.paths, fread) %>% 
+  bind_rows() %>% 
+  mutate(optimized_transaction_date = ymd(optimized_transaction_date), 
+         day_of_week = weekdays(optimized_transaction_date),
+         yr_mon = lubridate::round_date(optimized_transaction_date, unit = 'month'),
+         yr_week = paste0(lubridate::year(optimized_transaction_date), lubridate::isoweek(optimized_transaction_date)) ,
+         yr_week_start = lubridate::round_date(optimized_transaction_date, unit = 'week', week_start = 1)) %>% 
+  mutate(fed_elig = paste0(ever_fed, "-", elig)) %>% 
+  mutate(deferral = case_when(optimized_transaction_date < ymd("2020-09-01") ~ 'pre', 
+                              optimized_transaction_date >= ymd("2020-09-01") & optimized_transaction_date <= ymd("2020-12-31") ~ 'deferral',
+                              optimized_transaction_date >= ymd("2021-01-01") & optimized_transaction_date <= ymd("2021-12-31") ~ "payback", 
+         TRUE ~ 'post')) 
 
 
 ```
 
 
+
+
+
+```{r overall, echo = F}
+
+moneyshot <- function(x, timeframe, title){
+  x %>% 
+  filter(fed != "") %>% 
+  group_by(unique_mem_id, {{timeframe}}, ever_fed, elig) %>%
+  summarize(weekly_pay = sum(amount, na.rm = T)) %>%
+  group_by(unique_mem_id, ever_fed, elig) %>% 
+  mutate(scaled_amount = weekly_pay/mean(weekly_pay)) %>% 
+  group_by({{timeframe}}, ever_fed, elig) %>% 
+  summarize(scaled_avg_pay = mean(scaled_amount)) %>%
+  ggplot(aes(x = {{timeframe}}, y = scaled_avg_pay, group = ever_fed, color = ever_fed)) +
+  geom_point() +
+  geom_smooth(method = 'lm', formula = y ~ x, se = F) +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  labs(title = title) +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ ever_fed + elig, scales = 'free')
+}
+
+moneyshot(final, yr_week_start, "")
+
+
+```
+
+## Analysis By Employer
+
+* OPM doesn't seem eligible
+* USPS doesn't seem eligible
+* Why is government of Canada in here?
+* Pattern for treasury doesn't seem very strong
+* Even with very strict volatility restriction, the payments seem all over the place
+* DFAS has the clearest trend
+* Very few state/local employees survived the thresholds
+
+```{r employer, echo = F}
+
+fed_employers <- final %>% filter(ever_fed == 'federal' & fed != '') %>% 
+  select(primary_merchant_name) %>% pull(.) %>% unique(.)
+
+other_employers <- c("City Of New York", "City Of Chicago", "Commonwealth of Pennsylvania", "State Of Florida", "City of Houston")
+
+lapply(fed_employers, function(x) moneyshot(final %>% filter(primary_merchant_name == x ), yr_week_start, x))
+lapply(other_employers, function(x) moneyshot(final %>% filter(primary_merchant_name == x ), yr_week_start, x))
+
+```
+
+
+```{r indiv, echo = F}
+
+sample_ids <- final %>% filter( paycheck_vol < 10) %>% 
+  select(unique_mem_id) %>% pull(.) %>% sample(., 40)
+
+final %>% 
+  filter(fed != '' & unique_mem_id %in% sample_ids) %>% 
+  group_by(unique_mem_id) %>% 
+  mutate(scaled_amount = amount/mean(amount, na.rm = T)) %>% 
+  group_split(unique_mem_id) %>% 
+  map(~ ggplot(.,aes(x = optimized_transaction_date, y = scaled_amount)) +
+  geom_point() +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  labs(title = paste0(.$primary_merchant_name, "-", .$ever_fed, "-", .$elig)) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)))
+
+
+
+
+```
+
+
+## Salary Vs Government Income
+
+Even with the restriction on outside earnings (no more than 20% of total earnings), the desired effect becomes more muddled. I think it's reasonable to conclude that Salary/Regular Income is not actually a very good measure of earned wages. There are a bunch of transactions that look like benefits (small DFAS payments, child support).
+
+```{r sav_v_gov, echo = F}
+
+ final %>% 
+  filter(transaction_category_name == "Salary/Regular Income" & transaction_base_type == 'credit' ) %>% 
+  group_by(unique_mem_id, yr_week_start, ever_fed, elig) %>%
+  summarize(weekly_income = sum(amount, na.rm = T)) %>%
+  group_by(unique_mem_id, ever_fed, elig) %>% 
+  mutate(scaled_amount = weekly_income/mean(weekly_income)) %>% 
+  group_by(yr_week_start, ever_fed, elig) %>% 
+  summarize(scaled_avg_pay = mean(scaled_amount)) %>%
+  ggplot(aes(x = yr_week_start, y = scaled_avg_pay, group = ever_fed, color = ever_fed)) +
+  geom_point() +
+  geom_smooth(method = 'lm', formula = y ~ x, se = F) +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ ever_fed + elig, scales = 'free')
+
+```
+
+
+
+## Format of Regressions
+
+* Increase in coefficients during the treatment period (yay!)
+* No decrease in January (is it bc of pay raises that differ from state/federal)
+* Coefficients too large in my opinion (should be like .5-.1)
+* Are we sure that state/federal workers generally have the same trends in general? Perhaps check with some panel data with granular employment data
+
+$$ weeklypay_t = week_t + \beta_t*week_t*federal + \gamma_t*week_t*eligible + \delta_t*week*federal*eligible $$
+
+
+where the variable of interest are the weekly $\delta_t$. 
+
+```{r regs, echo = T}
+
+
+
+fes <- final %>% 
+  mutate(ever_fed = factor(ever_fed, levels = c('other', 'federal')),
+         elig = factor(elig, levels = c('inelig', 'elig'))) %>% 
+  filter(fed != "") %>% 
+  group_by(unique_mem_id, yr_week_start, ever_fed, elig) %>% 
+  summarize(amount = sum(amount, na.rm = T)) %>% 
+  group_by(unique_mem_id, ever_fed, elig) %>% 
+  mutate(scaled_amount = amount/mean(amount,na.rm = T)) %>% 
+  feols(scaled_amount ~ as.factor(yr_week_start)*ever_fed*elig, data = .)
+  
+data.frame(coef = summary(fes)$coefficients[479:636], 
+           se= summary(fes)$se[479:636] ,
+           date = seq.Date(ymd("2019-08-05"), ymd("2022-08-08"), by = 'week')) %>% 
+  mutate(deferral = case_when(date < ymd('2020-09-01') ~ "pre",
+                              date >= ymd("2020-09-01") & date <= ymd("2020-12-31") ~ 'deferral',
+                              date >= ymd("2021-01-01") & date <= ymd("2021-12-31") ~ "payback", 
+         TRUE ~ 'post')) %>% 
+  ggplot(aes(x = date, ymin = coef - 1.96*se, ymax = coef + 1.96*se, color = deferral)) +
+  geom_point(aes(x = date, y = coef)) +
+  geom_errorbar() +
+  labs(title = "Weekly Time Coefficients on Week*Federal*Eligible") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5))
+
+
+
+fes2 <- final %>% 
+  mutate(ever_fed = factor(ever_fed, levels = c('other', 'federal')),
+         elig = factor(elig, levels = c('inelig', 'elig'))) %>% 
+  filter(fed != "") %>% 
+  group_by(unique_mem_id, yr_mon, ever_fed, elig) %>% 
+  summarize(amount = sum(amount, na.rm = T)) %>% 
+  group_by(unique_mem_id, ever_fed, elig) %>% 
+  mutate(scaled_amount = amount/mean(amount,na.rm = T)) %>% 
+  feols(scaled_amount ~ as.factor(yr_mon)*ever_fed*elig, data = .)
+  
+data.frame(coef = summary(fes)$coefficients[113:149], 
+           se= summary(fes)$se[113:149] ,
+           date = seq.Date(ymd("2019-08-05"), ymd("2022-08-08"), by = 'month')) %>% 
+  mutate(deferral = case_when(date < ymd('2020-09-01') ~ "pre",
+                              date >= ymd("2020-09-01") & date <= ymd("2020-12-31") ~ 'deferral',
+                              date >= ymd("2021-01-01") & date <= ymd("2021-12-31") ~ "payback", 
+         TRUE ~ 'post')) %>% 
+  ggplot(aes(x = date, ymin = coef - 1.96*se, ymax = coef + 1.96*se, color = deferral)) +
+  geom_point(aes(x = date, y = coef)) +
+  geom_errorbar() +
+  labs(title = "Monthly Time Coefficients on Month*Federal*Eligible") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5))
+
+
+```
+
+## Early Covariate Analysis
+
+This is just the start of what I will show you. I'm going to rerun on the larger sample and craft a cleaner version of displaying the results. 
+
+```{r covariate, echo = F}
+
+
+transaction_categories <- final %>% count(transaction_category_name) %>% arrange(desc(n)) %>% slice(1:15) %>% select(transaction_category_name) %>% pull(.)
+
+final %>% 
+  filter(transaction_category_name %in% transaction_categories &
+           transaction_category_name != "Securities Trades" &
+           transaction_category_name != "Check Payment") %>% 
+  group_by(unique_mem_id, yr_mon, transaction_category_name, deferral, fed_elig) %>% 
+  summarize(amount = mean(amount, na.rm = T)) %>% 
+  group_by(transaction_category_name, deferral, fed_elig) %>% 
+  summarize(category_mean = mean(amount, na.rm = T), 
+            category_sd = sd(amount, na.rm = T)) %>% 
+  ggplot(aes(y = transaction_category_name, xmin = category_mean - 1.96*category_sd, xmax = category_mean + 1.96*category_sd, color= fed_elig)) +
+  geom_errorbar(position = position_dodge(width =0.2)) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom") +
+  facet_wrap(.~ deferral) 
+
+
+read.table(text = "ever_fed,elig,count,avg_observations,days_before,days_after,avg_range
+other,elig,129,6836,2768,703,3471
+federal,inelig,200,8160,3067,706,3774
+federal,elig,1497,7769,2709,707,3417
+other,inelig,6,8775,3131,688,3819
+", sep = ",", header = T)
+
+```
+
+## To-Do
+
+* Find more state workers
+* Download larger sample size and rerun results
+* Treat first paycheck in the deferral period as partly treated??
+* Find out more about how federal workers get their salary increases in Jan 2023 (is it the same for everybody?). What's the process for state workers?
+* More covariates (overdraft, unemployment, geography, etc. )
+
+## Questions for Adam
+1. **Beginning of Year Pay Increases** It looks like most federal workers get their pay raises in January. How should we account for the pay raise in our study, especially since state/local workers will not be receiving the same size of increase and state/local workers might be on a different pay cycle (for example, teachers get their pay raises at the beginning of the school year). 
+1. How far in advance do the federal workers know about their future raises?

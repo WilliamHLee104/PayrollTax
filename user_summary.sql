@@ -4,11 +4,16 @@ select a.*, b.ever_fed, b.elig
 from (select unique_mem_id, min(optimized_transaction_date) as min_date,
              max(optimized_transaction_date) as max_date, count(*) as n_transactions
 from yi_xpanelov6_20220816.bank_panel
-where mod(unique_mem_id,100) = 1
+where mod(unique_mem_id,100) < 5
 group by unique_mem_id) a
 inner join (select unique_mem_id, ever_fed, elig from temp_132.final group by unique_mem_id, ever_fed, elig) b
 on a.unique_mem_id = b.unique_mem_id)
 
+select ever_fed, elig, count(distinct unique_mem_id), avg(n_transactions) as avg_observations,
+       avg(datediff(day, min_date, '2020-09-01')) as days_before, avg(datediff(day, '2020-09-01',max_date)) days_after,
+       avg(datediff(day, min_date, max_date)) as avg_range
+from temp_132.user_history
+group by ever_fed, elig
 
 
 
@@ -56,14 +61,6 @@ create table temp_132.category_weekly AS (select unique_mem_id,
 
 
 select *
-from temp_132.final
-where optimized_transaction_date between '2022-01-01' and '2022-12-31'
-
-
-
-
-
-select *
 from temp_132.sample
 where transaction_base_type = 'credit' and
       (description ilike '%UI BEN%' or
@@ -99,6 +96,7 @@ where transaction_base_type = 'credit' and
   and description not ilike '%MN DEPT OF / DEED%'
   and description not ilike '%MN UI PAY%'
   and description not ilike '%NCDES%'
+  and description not ilike '%NYS DOL%'
   and description not ilike '%New Mexico DWS%'
   and description not ilike '%STATE OF NM%'
   and description not ilike '%JOB SERVICE ND%'

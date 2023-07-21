@@ -68,43 +68,45 @@ create table temp_132.filter1 as (SELECT b.*, a.avg_user_score
                  where avg_user_score > 6.5)
 
 -- Filter 2:Find all Qualifying Federal/State/Local Payroll Transactions
-create table temp_132.filter2 as (
-select *
-from (select *,
-             CASE
-                 WHEN ((upper(primary_merchant_name) like '%DFAS%' OR
-                        upper(primary_merchant_name) like '%U.S. DEPARTMENT OF THE TREASURY%' OR
-                        upper(primary_merchant_name) like '%US TREASURY%' OR
-                        upper(primary_merchant_name) like '%GOVERNMENT%' OR
-                        upper(primary_merchant_name) like '%GSA%' OR
-                        upper(primary_merchant_name) like '%THE GENERAL SERVICES ADMINISTRATION%' OR
-                        upper(primary_merchant_name) like '%THE U.S. OFFICE OF PERSONNEL MANAGEMENT%' OR
-                        upper(primary_merchant_name) like '%UNITED STATES COAST GUARD%' OR
-                        upper(primary_merchant_name) like '%U.S. DEPARTMENT OF HEALTH AND HUMAN SERVICES' OR
-                        upper(primary_merchant_name) like '%AGRICULTURAL TREASURY OFFICE%' OR
-                        upper(primary_merchant_name) like '%CENSUS%' OR
-                        upper(primary_merchant_name) like '%SOCIAL SECURITY ADMINISTRATION%' OR
-                        upper(primary_merchant_name) like '%FARM SERVICE AGENCY%' OR
-                        description ilike '%FED SAL%'
+create table temp_132.filter2 as (select *
+                                  from (select *,
+                                               CASE
+                                                   WHEN ((upper(primary_merchant_name) like '%DFAS%' OR
+                                                          upper(primary_merchant_name) like
+                                                          '%U.S. DEPARTMENT OF THE TREASURY%' OR
+                                                          upper(primary_merchant_name) like '%US TREASURY%' OR
+                                                          upper(primary_merchant_name) like '%GOVERNMENT%' OR
+                                                          upper(primary_merchant_name) like '%GSA%' OR
+                                                          upper(primary_merchant_name) like
+                                                          '%THE GENERAL SERVICES ADMINISTRATION%' OR
+                                                          upper(primary_merchant_name) like
+                                                          '%UNITED STATES COAST GUARD%' OR
+                                                          upper(primary_merchant_name) like
+                                                          '%U.S. DEPARTMENT OF HEALTH AND HUMAN SERVICES' OR
+                                                          upper(primary_merchant_name) like
+                                                          '%AGRICULTURAL TREASURY OFFICE%' OR
+                                                          upper(primary_merchant_name) like '%CENSUS%' OR
+                                                          upper(primary_merchant_name) like
+                                                          '%SOCIAL SECURITY ADMINISTRATION%' OR
+                                                          upper(primary_merchant_name) like '%FARM SERVICE AGENCY%' OR
+                                                          description ilike '%FED SAL%'
                      or description ilike '%FAA TREAS 310%'
                      or description ilike '%EPA TREAS 310%'
                      or description ilike '%GSA TREAS 310%'
                      or description ilike '%DOI1 TREAS 310%'
                      or description ilike '%DOT4 TREAS 310%'
                      or description ilike '%NIH  TREAS 310%' or description ilike '%NIH. TREAS 310%'
-                     or description ilike '%OPM1 TREAS 310%'
                      or description ilike '%DHS  TREAS 310%'
                      or description ilike '%LOC1 TREAS 310%'
                      or description ilike '%USSS TREAS 310%'
                      or description ilike '%CBP  TREAS 310%'
                      or description ilike '%DOJ  TREAS 310%'
                      or description ilike '%USSS TREAS 310%'
-                     or description ilike '%US HOUSE OF REPR%'
+                     or description ilike '%US HOUSE OF REP%'
                      or description ilike '%US SENATE FED SAL%'
                      or description ilike '%TENN VALLEY AUTH TRPDFEDSL%'
                      or description ilike '%TENN VALLEY AUTH ACH: TRPDFEDSL%'
                      or description ilike '%US SENATE FED SAL%'
-                     or description ilike '%USPS%'
                      or description ilike '%IN AF PAY%'
                      or description ilike '%IN ARMY ACT%'
                      or description ilike '%IN AF PAY%'
@@ -113,7 +115,7 @@ from (select *,
                      or description ilike '%NAVY ACT%'
                      or description ilike '%NAVY ALT%'
                      or description ilike '%NAVY RES%')
-                     AND description not ilike '%SSA  TREAS 310%'
+                                                       AND description not ilike '%SSA  TREAS 310%'
                      AND description not ilike '%SOC SEC%'
                      AND description not ilike '%VA BEN%'
                      AND description not ilike '%TREASURY PMN%'
@@ -175,8 +177,7 @@ from (select *,
                         upper(primary_merchant_name) like '%STATE COMPTROL%' or
                         upper(primary_merchant_name) like '%STATE CONTROLLER%' or
                         upper(primary_merchant_name) like '%ST OF%' or
-                        upper(primary_merchant_name) like '%STATEOF%' or
-                        upper(primary_merchant_name) like '%STATE OF%' or
+                        upper(primary_merchant_name) like '%STATE%' or
                         upper(primary_merchant_name) like '%COMMONWEALTH OF%' or
                         upper(primary_merchant_name) like '%DEPARTMENT OF%' or
                         upper(primary_merchant_name) like '%STATE DEPARTMENT%' or
@@ -252,38 +253,32 @@ from (select *,
                      and upper(primary_merchant_name) not like '%HOSPITAL%'
                      and upper(primary_merchant_name) not like '%RETIR%'
                      and upper(primary_merchant_name) not like '%REVENUE%') THEN 'state'
-                 WHEN ((upper(primary_merchant_name) like '%COUNTY OF%' or
-                        upper(primary_merchant_name) like '%COUNTY%' or
-                        upper(primary_merchant_name) like '%CITY OF%' or
-                        upper(primary_merchant_name) like '%DEPARTMENT OF%' or
-                        upper(primary_merchant_name) like '%CITY DEPARTMENT%' or
-                        upper(primary_merchant_name) like 'PUBLIC SCHOOLS')
-                     and description not ilike '%TAX%'
-                     and description not ilike '%UI%'
-                     and description not ilike '%DSS%'
-                     and description not ilike '%UNEMP%'
-                     and description not ilike '%REFUND%'
-                     and description not ilike '%BENEFIT%'
-                     and description not ilike '%CHILD%'
-                     and upper(primary_merchant_name) not like '%U.S. DEPARTMENT OF THE TREASURY%'
-                     and upper(primary_merchant_name) not like '%US DEPARTMENT OF EDUCATION%'
-                     and upper(primary_merchant_name) not like '%U.S. DEPARTMENT OF HEALTH AND HUMAN SERVICES%'
-                     and upper(primary_merchant_name) not like '%US TREASURY%'
-                     and upper(primary_merchant_name) not like '%DEPARTMENT OF VETERAN AFFAIRS%'
-                     and upper(primary_merchant_name) not like '%DEPARTMENT OF VETERANS AFFAIRS%'
-                     and upper(primary_merchant_name) not like '%ELECTRIC%'
-                     and upper(primary_merchant_name) not like '%GAS%'
-                     and upper(primary_merchant_name) not like '%UTILIT%'
-                     and upper(primary_merchant_name) not like '%Prince William County Service Authority%'
-                     and upper(primary_merchant_name) not like '%UNIVERSITY%'
-                     and upper(primary_merchant_name) not like '%HOSPITAL%'
-                     and upper(primary_merchant_name) not like '%RETIR%'
-                     and upper(primary_merchant_name) not like '%REVENUE%') THEN 'local'
+                 WHEN ((primary_merchant_name ilike '%COUNTY%' or
+       primary_merchant_name ilike '%CITY%' or
+       primary_merchant_name ilike '%PUBLIC SCHOOL%' or
+       primary_merchant_name ilike '%SCHOOL DISTRICT%' or
+       description ilike '%COUNTY%' or
+       description ilike '%CITY OF' or
+       description ilike '%SCHOOL DISTRICT%')
+  and description not ilike '%TAX%'
+  and description not ilike '%HOSPIT%'
+  and description not ilike '%UI%'
+  and description not ilike '%DSS%'
+  and description not ilike '%UNEMP%'
+  and description not ilike '%REFUND%'
+  and description not ilike '%BENEFIT%'
+  and description not ilike '%CHILD%'
+  and description not ilike '%PAYMENT%'
+  and description not ilike '%GAS%'
+  and description not ilike '%UTIL%'
+  and description not ilike '%REVENUE%'
+  and description not ilike '%RETIR%') THEN 'local'
                  ELSE 'other' END as fed
-      from temp_132.filter1
-      where transaction_base_type = 'credit'
-        and transaction_category_name = 'Salary/Regular Income'
-        and amount > 500) a
+                                  from temp_132.filter1
+                                  where transaction_base_type = 'credit'
+                                    and transaction_category_name = 'Salary/Regular Income'
+                                    and amount
+                                      > 500) a
 where fed not like 'other')
 
 
@@ -311,9 +306,10 @@ with filter3_totalincome as (select unique_mem_id, sum(amount) as total_income
                                            on a.unique_mem_id = b.unique_mem_id
                        where gov_income_ratio >= 80) -- This is the threshold
 select *
-from filter3_merge)
+from filter3_merge
+where unique_mem_id is not null)
 
-
+--drop table temp_132.filter3
 -- Filters 4 - 7 (Single Employer, Single Classification, Regular Intervals, Income Thresholds, Limited Volatility, Credit Card Match)
 
 -- Single employer and single classification
@@ -352,7 +348,7 @@ create table temp_132.filter7 as (with nemployers as (select unique_mem_id,
                                                                    then amount
                                                                else 0 end) as monthly_income,
                                                        case
-                                                           when annual_income > 104000 or monthly_income * 12 > 104000
+                                                           when (annual_income > 60000 or monthly_income * 12 > 5000) and annual_income <= 90000
                                                                then 'inelig'
                                                            else 'elig' end as elig
                                                 from temp_132.filter2
@@ -362,20 +358,22 @@ create table temp_132.filter7 as (with nemployers as (select unique_mem_id,
                                        cardmatch as (select a.unique_mem_id, -- Must match card paydowns
                                                             a.paydown_from_bank,
                                                             b.paydown_from_card,
-                                                            b.paydown_from_card * 100 / a.paydown_from_bank as card_perc_observed
+                                                            b.paydown_from_card * 100 / NULLIF(a.paydown_from_bank,0) as card_perc_observed
                                                      from (select unique_mem_id, sum(amount) as paydown_from_bank
                                                            from temp_132.sample
                                                            where transaction_base_type = 'debit'
                                                              and transaction_category_name = 'Credit Card Payments'
                                                            group by unique_mem_id) a
-                                                              inner join (select unique_mem_id, sum(amount) as paydown_from_card
+                                                              left join (select unique_mem_id, sum(amount) as paydown_from_card
                                                                           from temp_132.sample_card
                                                                           where transaction_base_type = 'credit'
                                                                             and transaction_category_name = 'Credit Card Payments'
                                                                           group by unique_mem_id) b
                                                                          on a.unique_mem_id = b.unique_mem_id
-                                                     where card_perc_observed >= 80
+                                                     where (card_perc_observed >= 80
                                                        and card_perc_observed <= 120)
+                                                       or card_perc_observed is null
+                                                     and a.unique_mem_id is not null)
                                   select nemployers.*,
                                          median_pay_freq,
                                          n_paychecks,
@@ -390,11 +388,12 @@ create table temp_132.filter7 as (with nemployers as (select unique_mem_id,
                                          qualifying_income,
                                          gov_income_ratio
                                   from nemployers
-                                           inner join payfreq on nemployers.unique_mem_id = payfreq.unique_mem_id
-                                           inner join elig on payfreq.unique_mem_id = elig.unique_mem_id
-                                           inner join cardmatch on elig.unique_mem_id = cardmatch.unique_mem_id
-                                           inner join temp_132.filter3
-                                                      on cardmatch.unique_mem_id = temp_132.filter3.unique_mem_id)
+                                       inner join temp_132.filter3
+                                                      on nemployers.unique_mem_id = temp_132.filter3.unique_mem_id
+                                            inner join payfreq on filter3.unique_mem_id = payfreq.unique_mem_id
+                                            inner join elig on payfreq.unique_mem_id = elig.unique_mem_id
+                                            inner join cardmatch on elig.unique_mem_id = cardmatch.unique_mem_id)
+-- drop table temp_132.filter7
 
 -- Put it all together
 -- drop table temp_132.final drop table temp_132.final_card

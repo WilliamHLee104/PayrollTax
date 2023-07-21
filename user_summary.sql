@@ -9,7 +9,7 @@ group by unique_mem_id) a
 inner join (select unique_mem_id, ever_fed, elig from temp_132.final group by unique_mem_id, ever_fed, elig) b
 on a.unique_mem_id = b.unique_mem_id)
 
-select ever_fed, elig, count(distinct unique_mem_id), avg(n_transactions) as avg_observations,
+select ever_fed, elig, count(distinct unique_mem_id) as unique_mem_ids, avg(n_transactions) as avg_observations,
        avg(datediff(day, min_date, '2020-09-01')) as days_before, avg(datediff(day, '2020-09-01',max_date)) days_after,
        avg(datediff(day, min_date, max_date)) as avg_range
 from temp_132.user_history
@@ -61,19 +61,20 @@ create table temp_132.category_weekly AS (select unique_mem_id,
 
 
 -- Unemployment Strings
-select description,
+select unique_mem_id, description,
        case
            when description ilike '%AK DEPT OF LABOR%' then 'AK'
            when description ilike '%STATE OF ARIZONA%' and description ilike '%BENEFITPAY' then 'AZ'
            when description ilike '%ADWS%' and
                 (description ilike '%UI BENEFIT%' or description ilike '%ADWS PUABENEFIT%') then 'AR'
-           when description ilike '%CDLE UI BENEFITS%' then 'CD'
+           when description ilike '%CDLE UI BENEFITS%' then 'CO'
            when description ilike '%CTDOL UNEMP%' then 'CT'
            when description ilike '%DELABOR UNEMPINS%' then 'DE'
            when description ilike '%D.C. EMPL%' then 'DC'
            when description ilike '%FL DEO%' and description ilike '%UI BENEFIT%' then 'FL'
            when description ilike '%GA DEPT OF LABOR%' and description ilike '%UI%' then 'GA'
-           when description ilike '%ID DEPT OF LABOR%' or description ilike '%IL DEPT OF EMPL SEC%'
+           when description ilike '%ID DEPT OF LABOR%' then 'ID'
+           when description ilike '%IL DEPT OF EMPL SEC%'
                or description ilike '%IL DEPT EMPL SEC%' or description ilike '%ILLINOIS EPAY%' then 'IL'
            when description ilike '%STATE OF INDIANA%' and description ilike '%UI PAYMENT%' then 'IN'
            when description ilike '%ST OF IA%' and description ilike '%UI PAY%' then 'IA'
@@ -82,18 +83,19 @@ select description,
            when description ilike '%LOUISIANA WORKFO%' then 'LA'
            when description ilike '%MAINE DEPT%' and description ilike '%LABOR%' and description ilike '%UNEMP%'
                then 'ME'
-           when description ilike '%MARYLAND%' and description ilike '%unemp%' then 'MD'
+           -- We only see MD debits, no credits (are these people paying insurance fees)
+           -- when description ilike '%MARYLAND%' and description ilike '%UNEMPINS%' then 'MD'
            when description ilike '%Massachusetts DUA%' or description ilike '%MA PUA%' or
                 primary_merchant_name ilike '%Massachusetts Department of Unemployment%' then 'MA'
            when description ilike '%UIA PRE-PAID%' or description ilike '%UIA PREPAID%' then 'MI'
            when description ilike '%MN DEPT OF DEED%' or description ilike '%MN DEPT OF / DEED%' then 'MN'
            when description ilike '%MDES BENEFITSUI%' then 'MS'
            when description ilike '%MODES %' and description ilike '%UI BENEFIT%' then 'MO'
-           when description ilike '%STATE OF MONTANA%' then 'MT'
+           when description ilike '%STATE OF MONTANA%' and description ilike '%MT%' then 'MT'
            when description ilike '%NEB WORKFORCE UIPAYMENT%' then 'NE'
            when description ilike '%NEVADA ESD%' or description ilike '%NV UI PAYMENTS%' then 'NV'
            when description ilike '%NHUS NHUC BEN%' then 'NH'
-           when description ilike '%STATE OF NJ' and (description ilike '%UNEMP%' or description ilike '%DUA%')
+           when primary_merchant_name ilike '%State of New Jersey%' and (description ilike '%UNEMP%' or description ilike '%DUA%')
                then 'NJ'
            when (description ilike '%New Mexico DWS%' or description ilike '%State of NM%') and description ilike '%UI%'
                then 'NM'
@@ -101,9 +103,11 @@ select description,
            when description ilike '%NCDES%' and description ilike '%UIBEN%' then 'NC'
            when description ilike '%JOB SERVICE ND%' then 'ND'
            when description ilike '%ODJFS%' then 'OH'
+           -- Oklahoma has some sort of 3rd party
            when description ilike '%EMPLOYMT BENEFIT%' and description ilike '%UI BENEFIT%' then 'OR'
            when description ilike '%COMM OF PA UCD' or description ilike '%PADLIUCCON%' then 'PA'
            when description ilike '%RIDLT-UI UIDD%' then 'RI'
+           -- couldn't find anything for SD. I guess nobody was unemployed there :)
            when description ilike '%SCESC%' then 'SC'
            when description ilike '%TNUIDD PAYMENT%' or description ilike '%TN UI PAYMENTS%' then 'TN'
            when description ilike '%TWC%' and description ilike '%BENEFIT%' then 'TX'
@@ -117,20 +121,9 @@ select description,
            when description ilike '%DEPT OF LABOR%' and description ilike '%UNEMPLYMNT%' then 'AL'
            when description ilike '%DEPT OF LABOR%' and description ilike 'UI BENEFIT%' then 'HI'
            else NULL end as ui_transaction,
-       primary_merchant_name
+       primary_merchant_name, transaction_category_name
 from temp_132.sample
 where transaction_base_type = 'credit'
-  and (description ilike '%UI BEN%'
-    or description ilike '%UI PAY%'
-    or description ilike '%UI PMT%'
-    or description ilike 'NEB WORKFORCE UI'
-    or description ilike '%LABOR'
-    or description ilike '%UNEMP%')
   and description not ilike '%UI PREPAY PLANS%'
+and ui_transaction is not null
 
-
-
-select description, primary_merchant_name
-from temp_132.sample
-where description ilike '%VDOL%'
-limit 25

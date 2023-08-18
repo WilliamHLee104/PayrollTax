@@ -1,0 +1,904 @@
+---
+title: "Transaction Classification Update"
+author: "William Lee"
+date: "`r Sys.time()`"
+bibliography: My Library.bib
+link-citations: true
+toc: yes
+output: 
+  pdf_document
+---
+
+## What have I been up to?
+
+-   Rewriting the code that identifies employers
+    - Now can separate between higher ed, local ed, and local.
+    - Broken down federal categories as much as possible by description string (e.g. now sort DFAS into Navy/Army/Air Force whenever possible)
+    - Instead of doing a broad search and eliminating case by case, I manually write out each case (hopefully fewer false positives)
+    - Runs in a more efficient manner on the AWS cluster
+-   I've come to the conclusion that Yodlee's transaction classification and primary_merchant was very bad (some salary payments show up as deposits, insurance, etc. and sometimes payments that obviously fit the same pattern as others are not given the same primary_merchant tag.)
+-   Went through each state to make sure we were not getting unemployment or child support benefits as income because Yodlee will mark those as coming from 'State of XX'. I hope I've ruled out all retirement benefits, but I can't be sure. Most of the state and federal payroll strings have 'Salary/Payroll/Misc' in them. I made sure to exclude 'ERS/RETIR' etc from consideration.
+-   Implemented new income cutoffs as per your suggestions (discussed more later)
+-   Downloaded a bigger sample
+-   Re-ran regressions
+
+```{r setup, include=FALSE, warning = FALSE}
+xfun::pkg_attach2('tidyverse', 'readxl', 'stats', 'sandwich', 'lmtest', 'ivreg', 'knitr', 
+                  'lubridate', 'data.table', 'kableExtra', 'rJava', 'RJDBC', 'fixest', 'kableExtra')
+
+knitr::opts_chunk$set(echo = FALSE, cache = T, warning = FALSE, message = FALSE)
+
+rm(list = ls())
+
+options(dplyr.summarise.inform = FALSE)
+options(scipen = 999)
+
+proj <- dirname(rstudioapi::getSourceEditorContext()$path)
+
+
+
+```
+
+```{r load, results = 'hide'}
+payroll_raw <- fread(file.path(proj, "rawdata", 'payroll.csv'))
+
+payroll <- payroll_raw %>% 
+  mutate(optimized_transaction_date = ymd(optimized_transaction_date), 
+         day_of_week = weekdays(optimized_transaction_date),
+         yr_qtr = ymd(lubridate::round_date(optimized_transaction_date, unit = 'quarter')),
+         yr_mon = ymd(lubridate::round_date(optimized_transaction_date, unit = 'month')),
+         yr_third = ymd(lubridate::round_date(optimized_transaction_date, unit = '4 months')),
+         yr_week_start = ymd(lubridate::round_date(optimized_transaction_date, unit = 'week', week_start = 1)),
+         elig = case_when(annual_income > 90000 & annual_income <= 110000 ~ 'inelig',
+                          annual_income > 75000 & annual_income <= 90000 ~ 'donut',
+                           annual_income > 30000 & annual_income <= 75000 ~ "elig",
+                          annual_income >= 110000 ~ 'fica_cap', 
+                          annual_income <= 30000 ~ '<30k', 
+                          TRUE ~ NA_character_), 
+         elig = factor(elig, levels = c('<30k', 'elig', 'donut', 'inelig', 'fica_cap' ))) %>% 
+  mutate(fed_elig = paste0(employer_type_list, "-", elig)) %>% 
+  mutate(deferral = case_when(optimized_transaction_date < ymd("2020-09-01") ~ 'pre', 
+                              optimized_transaction_date >= ymd("2020-09-01") & optimized_transaction_date <= ymd("2020-12-31") ~ 'deferral',
+                              optimized_transaction_date >= ymd("2021-01-01") & optimized_transaction_date <= ymd("2021-12-31") ~ "payback", 
+         TRUE ~ 'post'),
+         deferral = factor(deferral, levels = c("pre", "deferral", "payback", "post"))) %>% 
+  mutate(bin = cut(annual_income, breaks = seq(30000, 150000, by = 5000), labels = as.character(seq(30000, 145000, by = 5000))))
+```
+
+One thing that's a bit odd in the Yodlee data is that sometimes the strings patterns will abruptly switch for no discerable reason (or at least a reason I have not been able to discern). For example, an individual might receive most of their pay from with one pattern that identifies them as DFAS but will then have a few strings that identify them as DFAS- NAVY. After discussing this with Scott, we have decided to mark this person as DFAS-NAVY for all of their transactions. 
+
+For some of the US Treasury employees, it looks like they receive their base salary from *'FED SAL'* and then receive *'MISC PAY'* from an TREAS 310 account that shows their department. Again, after discussing this with Scott, we have decided to mark all of their transactions as coming from the agency in the MISC PAY. 
+
+I've included a few examples in the plot below where each panel is a different unique_mem_id. I'm particularly interested in bottom right panel where it looks like the person goes from DFAS to US TREASURY but maintains almost the exact same salary. Do we think this is a job switch or just a switch in the formatting. I'm just a switch in the formatting since there are others with the same pattern. Currently, I'm assigning this person to US TREASURY for all the payments.
+
+There is this enormous guide that seems like it should have the answers if I read enough. <https://www.dfas.mil/contractorsvendors/miscpaymentguide/>
+
+```{r clean, results = 'hide'}
+
+payroll %>% filter(unique_mem_id == '455388545673253548295501' | unique_mem_id == '827998461566616733317801' | 
+                     unique_mem_id == '189316050971463958945707' | unique_mem_id == '718059337967765460589907') %>% 
+  arrange(optimized_transaction_date) %>% 
+  ggplot(aes(x = optimized_transaction_date, y = amount, color = employer)) +
+  geom_point() +
+  theme_bw() +
+  facet_wrap(.~ unique_mem_id, nrow = 2) +
+  theme(legend.position = 'bottom')
+
+# Corrects the people who have two employers but probably actually only have 1
+payroll <- payroll %>% 
+  rename(employer_raw = employer) %>% #renaming for convenience
+  filter(n_employers > 1) %>% 
+  group_by(unique_mem_id) %>% 
+  summarize(employers = paste(unique(employer_raw), collapse = ":")) %>% 
+  mutate(employer = case_when(
+         grepl('DFAS - ARMY', employers) ~ 'DFAS - ARMY',
+         grepl('DFAS - NAVY', employers) ~ 'DFAS - NAVY',
+         grepl('DFAS - AIR FORCE', employers) ~ 'DFAS - AIR FORCE',
+         grepl('DFAS - MARINES', employers) ~ 'DFAS - MARINES',
+         grepl('COAST GUARD', employers) ~ 'UNITED STATES COAST GUARD',
+         grepl("DFAS", employers) & grepl('TREASURY', employers) ~ 'US TREASURY',
+         grepl('TREASURY', employers) & grepl('GENERAL SERVICES ADMINISTRATION', employers) ~ "GENERAL SERVICES ADMINISTRATION",
+         grepl('TREASURY', employers) & grepl('HOMELAND SECURITY', employers) ~ "DEPARTMENT OF HOMELAND SECURITY",
+         grepl('TREASURY', employers) & grepl('CUSTOMS AND BORDER PROTECTION', employers) ~ "DEPARTMENT OF HOMELAND SECURITY",
+         grepl('TREASURY', employers) & grepl('AGRICULTURAL TREASURY OFFICE', employers) ~ "AGRICULTURAL TREASURY OFFICE",
+         grepl('TREASURY', employers) & grepl('DEPARTMENT OF THE INTERIOR', employers) ~ 'DEPARTMENT OF THE INTERIOR',
+         grepl('TREASURY', employers) & grepl('DEPARTMENT OF TRANSPORTATION', employers) ~ 'DEPARTMENT OF TRANSPORTATION',
+         grepl('TREASURY', employers) & grepl('DEPARTMENT OF STATE', employers) ~ 'DEPARTMENT OF STATE',
+         grepl('TREASURY', employers) & grepl('DEPARTMENT OF JUSTICE', employers) ~ 'DEPARTMENT OF JUSTICE',
+         grepl('TREASURY', employers) & grepl('ENVIRONMENTAL PROTECTION AGENCY', employers) ~ 'ENVIRONMENTAL PROTECTION AGENCY',
+         grepl('TREASURY', employers) & grepl('FEDERAL AVIATION ADMINISTRATION', employers) ~ 'FEDERAL AVIATION ADMINISTRATION',
+         grepl('TREASURY', employers) & grepl('NATIONAL INSTITUTES OF HEALTH', employers) ~ "NATIONAL INSTITUTES OF HEALTH",
+         grepl('TREASURY', employers) & grepl('FEDERAL EMERGENCY MANAGEMENT AGENCY', employers) ~ "FEDERAL EMERGENCY MANAGEMENT AGENCY",
+         grepl('TREASURY', employers) & grepl('UNITED STATES COAST GUARD', employers) ~ "UNITED STATES COAST GUARD",
+         grepl('TREASURY', employers) & grepl('DEPARTMENT OF HEALTH AND HUMAN SERVICES', employers) ~ "DEPARTMENT OF HEALTH AND HUMAN SERVICES",
+         grepl('TREASURY', employers) & grepl('NATIONAL INSTITUTES OF HEALTH', employers) ~ "NATIONAL INSTITUTES OF HEALTH",
+         grepl('TREASURY', employers) & grepl('UNITED STATES SECRET SERVICE', employers) ~ "UNITED STATES SECRET SERVICE",
+         grepl('TREASURY', employers) & grepl('DEPARTMENT OF HEALTH AND HUMAN SERVICES', employers) ~ "DEPARTMENT OF HEALTH AND HUMAN SERVICES",
+         grepl('TREASURY', employers) & grepl('DEPARTMENT OF HEALTH AND HUMAN SERVICES', employers) ~ "DEPARTMENT OF HEALTH AND HUMAN SERVICES",
+         grepl('TREASURY', employers) & grepl('DEPARTMENT OF HEALTH AND HUMAN SERVICES', employers) ~ "DEPARTMENT OF HEALTH AND HUMAN SERVICES")) %>% 
+  full_join(payroll %>% rename(employer_raw = employer), by = 'unique_mem_id') %>% 
+  mutate(employer = case_when(is.na(employer) & n_employers > 1 ~ NA_character_,
+                              is.na(employer) & n_employers == 1 ~ employer_raw,
+                              !is.na(employer) ~ employer)) %>% 
+  filter(n_employers == 1 | (n_employers > 1 & !is.na(employer))) # drops people who had 2 employers and didn't fit into one of the exceptions
+
+
+
+
+```
+
+## String Search Update
+
+After our last meeting, I realized that I needed to put some effort into improving the method of finding eligible employers. I was especially concerned with the cases where payroll transactions were mis-classified or where non-wage income might appear to be Salary/Regular Income (i.e. child support or OPM pension payments looking like regular income). I've learned a decent amount by just looking at the strings:
+
+-   We can determine which agency a person works for in the federal government whenever they receive MISC/TVL pay. 
+-   Went state by state to find their payroll strings and common benefit strings (unemployment, retirement, child support) to make sure we are only getting payroll. We now have coverage for almost 40 states instead of the 10 for the last update. 
+-   Found the payment strings for the largest public universities (and smaller universities that were clearly marked in the Yodlee data) to make sure state payroll is identified separately from state higher ed
+-   Separated local strings by local and local_education for similar reasons - education spending is more volatile, different employment dynamics, etc. We are missing a few of the top largest cities (possibly because they use a benefit manager).
+
+Overall, the underlying strategy of the algorithm shifted. Instead of starting with all primary_merchants that match 'STATE OF' and then manually removing non-state vendors like 'ALLSTATE OF IL', I now only consider strings/merchants that match the **when primary_merchant_name ilike '%STATE OF ILLINOIS%' and description similar to '(%Payroll%\|%Deposit%)' and description not similar to '(%Commercial%\|%Tax%)' then 'IL'**. I think this is probably what I should have done in the first place, but we can always go back to the original method if you think that's better.
+
+### Federal
+
+
+* Dropped Amtrak since it looks like they got paid by hours worked which was obviously off during the pandemic
+* Still need to figure out why the pattern switches between DFAS and DFAS-NAVY or at least figure out if it corresponds to any significant economic event (reassignment, active duty pay, off-base housing etc.)
+
+```{r federal}
+
+payroll %>% 
+  filter(employer_type == 'federal') %>% 
+  group_by(employer) %>% 
+  summarize(num_indiv = uniqueN(unique_mem_id)) %>% 
+  arrange(desc(num_indiv)) %>% 
+  kable() 
+
+```
+
+
+
+```{r employer_graph}
+employer_graph <- function(employer_class, timeframe, cutoff_date, elig, employer_selection, title){
+
+payroll %>% 
+  filter(yr_third < ymd('2022-05-01')) %>% 
+  filter(employer %in% employer_selection & elig %in% elig & employer_type == employer_class) %>%
+  group_by(unique_mem_id, {{timeframe}}, employer) %>%
+  summarize(period_pay_mean = mean(amount, na.rm = T),
+            period_pay_sum = sum(amount, na.rm = T)) %>%
+  group_by(unique_mem_id, employer) %>%
+  mutate(denom_mean = ifelse(length(period_pay_mean[{{timeframe}} == ymd(cutoff_date)]) == 1, period_pay_mean[{{timeframe}} == ymd(cutoff_date)], NA),
+         denom_sum = ifelse(length(period_pay_sum[{{timeframe}} == ymd(cutoff_date)]) == 1, period_pay_sum[{{timeframe}} == ymd(cutoff_date)], NA)) %>%
+  filter(!is.na(denom_mean)) %>%
+  mutate(scaled_amount_mean = period_pay_mean/denom_mean, scaled_amount_sum = period_pay_sum/denom_sum) %>%
+  group_by({{timeframe}}, employer) %>%
+  summarize(scaled_avg_pay_sum = mean(scaled_amount_sum), scaled_avg_pay_mean = mean(scaled_amount_mean)) %>% 
+  pivot_longer(cols = -c({{timeframe}}, employer))  %>%
+  ggplot(aes(x = {{timeframe}}, y = value, group = employer, color = employer)) +
+  geom_point() +
+  geom_smooth(method = 'lm', formula = y ~ x, se = F) +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  labs(title = title) +
+  scale_y_continuous(limits = c(0.8,1.2)) +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5),
+        legend.text=element_text(size=08),
+        legend.title = element_text(size = 0.8)) +
+  facet_wrap(.~ name, scales = 'free') +
+  guides(fill=guide_legend(nrow=3,byrow=TRUE))
+}
+```
+
+-   You get different results if you use per period total pay or if you use average paycheck size. Would like your thoughts?
+
+```{r employer_graph1}
+
+employer_graph('federal', yr_third, '2020-05-01', 'elig', 
+               c('DFAS', 'DFAS - ARMY', 'DFAS - NAVY', 'DFAS - AIR FORCE', 'UNITED STATES COAST GUARD', 'DFAS - MARINES'), 
+               "SELECTED FED EMPLOYERS")
+```
+
+```{r employer_graph2}
+employer_graph('federal', yr_third, '2020-05-01', 
+               'elig', c('US TREASURY', 'AGRICULTURAL TREASURY OFFICE', 'DEPARTMENT OF HOMELAND SECURITY',
+                                    'DEPARTMENT OF JUSTICE',
+                                    'DEPARTMENT OF TRANSPORTATION','FEDERAL EMERGENCY MANAGEMENT AGENCY', 'GENERAL SERVICES ADMINISTRATION'), 
+               "SELECTED FEDERAL EMPLOYERS")
+```
+
+-   Why is the GSA so off in sums but not in means?
+-   Removed reservists. The logic being that it's not a regular income, not a large fraction of income anyways.
+-   Unsure why service branch is mentioned in some but not others. Would be concerning if the change had something to do with retirement.
+
+### State (Higher Ed and Traditional)
+
+-   Hopefully fewer false positives (manually inspected each string to see what was included).
+-   Allows for further investigation of within-employer variation along the lines of some other previous work
+-   Still probably below the actual fraction of state employees because university/corrections/hospital all are likely paid directly from their subsidiary. Unless you really want to be thorough and search for these sub-departments, we will probably have to be fine with missing them. At least we can be fairly sure that the basic payroll strings are most likely to capture our regular office workers.
+-   Initially, I was worried because we had the states showing up way out of proportion to their population. Now it seems much more reasonable. PA, OH, FL, NY, CA are all near the top.
+-   Some of these universities capture entire systems (e.g. University of Illinois is probably capturing University of Illinois in Chicago), but I would need to double-check that.
+-   I'd love to know why the coverage in some states is so bad. Is it due to gaps in regional coverage in the Yodlee data? Is it variation in how states handle payroll (departments vs. centralized system)? Somebody may ask why Maryland is higher than California in our number of observations? Of course, the selection in Yodlee only matters if it's correlated with member observables or outcome variables. My only concern would be that state employees might be incentivized to work with a local bank (eg. Illinois State Employees Credit Union) that doesn't have a contract with Yodlee. I believe Yodlee has some details on type of institutions, so we could check that at a later date.
+
+```{r state}
+
+payroll %>% 
+  filter(employer_type == 'state') %>% 
+  group_by( employer) %>% 
+  summarize(num_indiv = uniqueN(unique_mem_id)) %>% 
+  arrange( desc(num_indiv)) %>% 
+  kable() 
+
+payroll %>% 
+  filter(employer_type == 'public_univ') %>% 
+  group_by( employer) %>% 
+  summarize(num_indiv = uniqueN(unique_mem_id)) %>% 
+  arrange( desc(num_indiv)) %>% 
+  kable() 
+
+```
+
+### Local (City/County/Education)
+
+```{r local}
+
+local_employers_df <- payroll %>% 
+  filter(employer_type == 'local') %>% 
+  group_by(employer_type, employer) %>% 
+  summarize(num_indiv = uniqueN(unique_mem_id)) %>% 
+  arrange(employer_type, desc(num_indiv))
+
+local_educ_df <- payroll %>% 
+  filter(employer_type == 'local_educ') %>% 
+  group_by(employer_type, employer) %>% 
+  summarize(num_indiv = uniqueN(unique_mem_id)) %>% 
+  arrange(employer_type, desc(num_indiv)) 
+
+```
+
+We have `r length(local_employers_df$employer)` number of local non-education employers and `r length(local_educ_df$employer)` number of local non-education employers which is not a substantial change from before. I went throughout the list to see how many of the top 100 cities we had, and I would estimate we have 60% of the top 100 cities in the US here. Not all employees survive the filters as we discussed earlier -- likely due to variable pay/hours worked/etc.
+
+```{r local2}
+kable(local_employers_df)
+kable(local_educ_df)
+```
+
+### Private Employers
+
+You floated the idea of including large public employers as an additional control group, so I wanted to give you a bit of info on that option. Large private employers seem to have very spotty coverage as measured by *primary_merchant_name*. Large employers like Cisco, Microsoft, Apple, and others are included in the Yodlee data, but we would have to do a rigorous search of large private employers and potentially do some re-balancing to make them reflect the broader population.
+
+
+
+```{r moneyshot, echo = F}
+moneyshot <- function(x, timeframe, title){
+  x %>% 
+  group_by(unique_mem_id, {{timeframe}}, fed_elig) %>%
+  summarize(weekly_pay = sum(amount, na.rm = T)) %>%
+  group_by(unique_mem_id, fed_elig) %>% 
+  mutate(scaled_amount = weekly_pay/mean(weekly_pay)) %>% 
+  group_by({{timeframe}}, fed_elig) %>% 
+  summarize(scaled_avg_pay = mean(scaled_amount)) %>%
+  ggplot(aes(x = {{timeframe}}, y = scaled_avg_pay)) +
+  geom_point(size = 1) +
+  geom_smooth(method = 'lm', formula = y ~ x, se = F) +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  labs(title = title) +
+  ylim(c(0.85,1.15))+
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ fed_elig, scales = 'fixed')
+}
+```
+
+```{r moneyshot1, echo = F}
+moneyshot(payroll %>% 
+            filter(elig %in% c('elig', 'inelig')) %>% 
+            mutate(fed_elig = paste0(case_when(employer_type == 'federal' ~ 'federal', TRUE ~ 'other'),"-", elig)),
+          yr_week_start, "")
+```
+
+```{r moneyshot2, echo = F}
+moneyshot(payroll %>% 
+            filter(elig %in% c('elig', 'donut', 'inelig', 'fica_cap') & yr_third < ymd('2022-05-01') & 
+                     employer_type %in% c('federal', 'state', 'local', 'public_univ')), yr_third, "")
+
+```
+
+-   Federal ineligible also experience a decent pay raise
+
+## Updated Waterfall
+
+Recall the definitions. Please forgive me for the numbering errors last time. I really hate that there are now multiple documents with different numbering and definitions, so please don't reference across documents.
+
+### Definition of Federal Worker/Eligibilty
+
+Since we are not able to directly observe whether or not a given user was eligible/enrolled in the Payroll Tax Deferment, we have to infer eligibility from the transaction data and refine our sample so that we have high-quality treatment and control groups. So far, we are working under the assumption that an eligible federal worker is one who:
+
+1.  Has an average Yodlee Score of at least 6.5 from August 2019 - Dec 2022. (This is Yodlee's suggested value for a 'stable' user.)
+2.  Has qualifying payment observations (based on description, primary_merchant, and amount fields).[^1]
+3.  Single Classification (i.e. only ever receive a paycheck from federal employers, state employers, or local employers but never a combination of categories).
+4.  No more than 1 employer within a category, excluding the cases where DFAS/US TREASURY switched patterns.(Note: This was done to allow for idiosyncrasies in the description string patterns and Yodlee's determination of the primary_merchant.)
+5.  At least 30 qualifying paychecks over the sample period.
+6.  Earn at least 10k in each 4 month period throughout the sample period.
+7.  A median paycheck frequency between 7 and 35 days (i.e. most paychecks come at a regular interval)
+8.  Observe no more than 40% of total inflows from other sources of income (outside income = Gov Income + Interest Income + Other Income + Deposits + Insurance + Investment/Retirement Income + Taxes + Salary/Regular Income + Sales/Services Income)
+9.  Observe no more than 35% volatility between paychecks to rule out employees with varying hours worked,travel reimbursements,etc.
+
+[^1]: transaction must be greater than \$200, from an identified vendor, marked as transaction_base_type = 'credit' and transaction_category_name in ('Salary/Regular Income', 'Investment/Retirement Income', 'Deposits', 'Education', 'Services/Supplies', 'Other Income', 'Utilities') by Yodlee and not marked as a duplicate transaction
+
+```{r waterfall2, eval = T}
+waterfall2 <- fread(file.path(proj, 'rawdata', 'waterfall2.csv'))
+
+# By Category
+waterfall2 %>% 
+  bind_rows(waterfall2 %>%
+  group_by(employer_type) %>% 
+  summarize_at(vars(-elig), .funs = sum) %>% 
+  mutate(elig = 'total')) %>% 
+  mutate(elig = factor(elig, levels= c('<30k', 'elig', 'donut', 'inelig', 'fica', 'total'))) %>% 
+  arrange(employer_type, elig) %>% 
+  purrr::set_names(c( "type", "elig", 'f2', "class", "emp", "chqs", "pds10k", "freq", "gov", "vol")) %>% 
+  kable() %>% 
+  #kable_styling(font_size = 7) %>% 
+  row_spec(c(6,12,18,24,30, 36), bold = T, hline_after = T)
+
+# By all categories
+waterfall2 %>% 
+  group_by() %>% summarize_at(vars(-c(elig, employer_type)), .funs = sum) %>% 
+  mutate(elig = 'total') %>% 
+  bind_rows(waterfall2 %>%
+  group_by(elig) %>% 
+  summarize_at(vars(-employer_type), .funs = sum)) %>% 
+  mutate(elig = factor(elig, levels= c('<30k', 'elig', 'donut', 'inelig', 'fica', 'total'))) %>% 
+  arrange( elig) %>% 
+  subset(select = c(9,1,2,3,4,5,6,7,8)) %>% # re-orders the columns
+  purrr::set_names(c("elig", 'f2', "class", "emp", "chqs", "pds10k", "freq", "gov", "vol")) %>% 
+  kable() %>% 
+  kable_styling() %>% 
+  row_spec(c(0,6), bold = T, hline_after = T)
+```
+
+
+You asked to see whether these people with pay-cycles of one week are actually two earners. Judging by these plots, it's definitely possible, especially when there are clearly two paycheck amounts. It could also be a housing allowance or other types of compensation. Would love your opinion. Regardless, it doesn't seem to change the regression results (not a honest reason for keeping them but still...)
+
+```{r median_freq, eval = T}
+
+ids <- payroll_raw %>% 
+  filter(median_pay_freq >= 7 & median_pay_freq <= 10) %>% 
+  count(unique_mem_id) %>% 
+  select(unique_mem_id) %>% select(unique_mem_id) %>% pull(.)
+
+payroll_raw %>% 
+  filter(unique_mem_id %in% ids[1:6]) %>% 
+  ggplot(aes(x = optimized_transaction_date, y = amount/1000, color = employer)) +
+  geom_point() +
+  theme_bw() +
+  facet_wrap(.~ unique_mem_id, nrow = 3, scales = 'free_y') +
+  theme(legend.position = 'bottom', strip.background = element_blank(), strip.text = element_blank())
+
+```
+
+Some thoughts and key highlights:
+
+-   Changed definition of outside income (see next section). Yodlee misclassifies a small amount of transactions, but it's enough to matter. The difference is quite apparent in the regression analysis to follow. 
+-   Dropped filter for credit card linkage (we were losing too many users), and it's not necessary for the first stage anyways. When we get to regressions involving credit card usage, we can just restrict the sample then.
+-   The definition of regular intervals changed a bit.
+
+```{r waterfall}
+
+
+user_score <- fread(file.path(proj, 'rawdata', 'User_Score_Dist.csv'))
+
+user_score %>% 
+  ggplot(aes(x = avg)) +
+  geom_histogram(bins = 100, fill= 'steelblue', color = 'black') +
+  geom_vline(aes(xintercept = 6.5), color = 'red') +
+  labs(title = 'Average User_Score Jan 2020') +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+waterfall <- fread(file.path(proj, 'rawdata', 'waterfall.csv')) %>% 
+  mutate(filter = case_when(n_classification != 1 ~ 'n_classification',
+                            n_employers > 2 ~ 'n_employers', 
+                            n_paychecks < 30 ~ 'n_paychecks', 
+                            num_periods10k < 12 ~ 'num_periods10k',
+                            median_pay_freq < 7 | median_pay_freq > 35 ~ 'median_pay_freq', 
+                            gov_income_ratio < 60 ~ 'gov_income_ratio', 
+                            paycheck_vol > 35 ~ 'paycheck_vol',
+                            TRUE ~ 'satisfy_all'),
+         filter = factor(filter, levels = c('n_classification', 'n_employers', 'n_paychecks', 
+                                            'num_periods10k', 'median_pay_freq', 'gov_income_ratio', 'paycheck_vol', 'satisfy_all')))
+
+
+waterfall_graph <- function(variable, title, xlimits, cutoff, cutoff2){
+  waterfall %>% 
+  ggplot(aes(x = !!sym(variable), fill = filter)) +
+  geom_histogram() +
+  geom_vline(aes(xintercept = cutoff), color = 'red') +
+  geom_vline(aes(xintercept = cutoff2), color = 'red') +
+  theme_bw() +
+  scale_x_continuous(limits = xlimits) + 
+  labs(title = title) +
+  theme(plot.title = element_text(hjust = 0.5))
+}
+
+
+
+pmap(list(variable = c('n_classification', 'n_employers', 'n_paychecks', 'num_periods10k', 
+                       'median_pay_freq', 'gov_income_ratio', 'paycheck_vol'),
+          title = c('n_classification', 'n_employers', 'n_paychecks', 'num_periods10k', 
+                       'median_pay_freq', 'gov_income_ratio', 'paycheck_vol'),
+          xlimits = list(c(0.9,5), c(0.9,5), c(10,400), NULL, c(0,40), c(0,101) , c(0,200)), 
+          cutoff = c(1.5, 2.5, 30, 11.5, 6.5, 60, 35),
+          cutoff2 = c(NA, NA, NA, NA, 35, NA, NA)),
+      waterfall_graph)
+
+  
+
+```
+
+```{r waterfallincome}
+
+waterfall %>% 
+  filter(num_periods == 12) %>% 
+  ggplot(aes(x = qualifying_income/4, group = employer_type, color = employer_type)) +
+  geom_density(lwd = 1.5) +
+  scale_x_continuous(limits = c(10000,150000)) +
+  labs(title = "Annual Income of Individuals by Employer Type", x = "Annual Income") + 
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+### Change to Outside Income Definition
+
+I have come to the realization that the Salary/Regular Income is not a very good definition of salary. Plenty of transactions that clearly fit into the approved strings are classified into Deposits, Insurance, or Other Income. I have expanded the search for qualifying strings, AND I have broadened the scope of categories for outside income while lowering the threshold to no more than 40% of income coming from outside sources. Outside Income = Interest Income + Other Income + Deposits + Insurance + Investment/Retirement Income + Taxes + Salary/Regular Income + Sales/Services Income
+
+$$ \frac{Gov Income}{Outside Income} > 60$$
+
+### Examining the Waterfall Cutoffs
+
+## Examining the Income Thresholds
+
+What happened toward the lower end of the federal spectrum?
+
+```{r elig, echo = F}
+
+elig_bins <- payroll %>% 
+  mutate(ever_fed = case_when(employer_type == 'federal' ~ 'federal', TRUE ~ 'other')) %>% 
+  filter(yr_third == ymd('2020-05-01') | yr_third == ymd('2020-09-01')) %>% 
+  group_by(unique_mem_id, elig, yr_third, bin, ever_fed) %>% 
+  summarize(period_amt = sum(amount, na.rm = T)) %>%  # average weekly pay by treatment period
+  group_by(unique_mem_id, elig, bin, ever_fed) %>% 
+  summarize(perc_growth = period_amt[yr_third == ymd('2020-09-01')]/period_amt[yr_third == ymd('2020-05-01')] - 1) %>% 
+  group_by(bin, elig, ever_fed) %>% 
+  summarize(perc_growth = mean(perc_growth, na.rm = T), n= n())
+
+elig_bins %>% 
+  filter(!is.na(elig) & !is.na(bin)) %>% 
+  ggplot(aes(x = as.numeric(as.character(bin))/1000, y = perc_growth, color = elig)) +
+  geom_point() +
+  xlim(c(30,135)) +
+  geom_vline(xintercept = 75, color= 'black') +
+  geom_vline(xintercept = 90, color= 'black') +
+  geom_vline(xintercept = 110, color= 'black') +
+  geom_hline(yintercept = 0, color = 'black') +
+  labs(title = "Percent Income Growth from (May-Aug) to (Sept - Dec) 2020 for Fed Employees", 
+       x= 'Annual Income Sept 2019 - Sept 2020, Thousands') +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ ever_fed, scales = 'free', ncol = 1)
+  
+
+```
+
+The next graph shows the difference between federal and other (exempt fed/state/higher ed/local/local ed) employees
+
+```{r altelig, echo = F}
+elig_bins %>% 
+  select(-n) %>% 
+  pivot_wider(names_from = ever_fed, values_from = perc_growth) %>% 
+  mutate(difference = federal - other) %>% 
+  ggplot(aes(x = as.numeric(as.character(bin))/1000, y = difference, color = elig)) +
+  geom_point() +
+  xlim(c(30,135)) +
+  geom_vline(xintercept = 75, color= 'black') +
+  geom_vline(xintercept = 90, color= 'black') +
+  geom_vline(xintercept = 110, color= 'black') +
+  geom_hline(yintercept = 0.062, color = 'black') +
+  annotate("text", x = 125, y = 0.08, label = "6.2% Deferral") +
+  labs(title = "Percent Income Growth from (May-Aug) to (Sept - Dec) 2020 \n for Fed Employees - Other Employees", 
+       x= 'Annual Income Sept 2019 - Sept 2020, Thousands') +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5))
+```
+
+I don't think USPS is a good control group. There is **a lot** of variability, probably due to seasonal variation, variation in hours worked, and holiday pay.
+
+```{r altelig2, echo = F, eval = F}
+# Comparing Federal vs USPS
+elig_bins2 <- payroll %>% 
+  mutate(ever_fed = case_when(employer_type == 'federal' ~ 'federal', TRUE ~ 'other')) %>%
+  filter(employer_type == 'exempt_federal' | employer_type == 'federal') %>% 
+  filter(yr_third == ymd('2020-05-01') | yr_third == ymd('2020-09-01')) %>% 
+  group_by(unique_mem_id, elig, yr_third, bin, ever_fed) %>% 
+  summarize(period_amt = sum(amount, na.rm = T)) %>%  # average weekly pay by treatment period
+  group_by(unique_mem_id, elig, bin, ever_fed) %>% 
+  mutate(pre = ifelse(length(period_amt[yr_third == ymd('2020-05-01')]) == 0, NA, period_amt[yr_third == ymd('2020-05-01')]),
+         post = ifelse(length(period_amt[yr_third == ymd('2020-09-01')]) == 0, NA, period_amt[yr_third == ymd('2020-09-01')])) %>% 
+  filter(!is.na(pre) & !is.na(post)) %>% 
+  summarize(perc_growth = mean(pre)/mean(post)) %>% 
+  group_by(bin, elig, ever_fed) %>% 
+  summarize(perc_growth = mean(perc_growth, na.rm = T), n= n()) 
+
+
+elig_bins2 %>% 
+  select(-n) %>% 
+  pivot_wider(names_from = ever_fed, values_from = perc_growth) %>% 
+  mutate(difference = federal - other) %>% 
+  ggplot(aes(x = as.numeric(as.character(bin))/1000, y = difference, color = elig)) +
+  geom_point() +
+  xlim(c(30,135)) +
+  geom_vline(xintercept = 75, color= 'black') +
+  geom_vline(xintercept = 90, color= 'black') +
+  geom_vline(xintercept = 110, color= 'black') +
+  geom_hline(yintercept = 0.062, color = 'black') +
+  annotate("text", x = 125, y = 0.08, label = "6.2% Deferral") +
+  labs(title = "Percent Income Growth from (May-Aug) to (Sept - Dec) 2020 \n for Fed - USPS", 
+       x= 'Annual Income Sept 2019 - Sept 2020, Thousands') +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) 
+
+payroll %>% 
+  mutate(ever_fed = case_when(employer_type == 'federal' ~ 'federal', TRUE ~ 'other')) %>%
+  filter(employer == "USPS" & yr_third < ymd('2022-05-01')) %>% 
+  group_by(unique_mem_id, yr_third, ever_fed, elig) %>%
+  summarize(period_pay = sum(amount, na.rm = T)) %>%
+  group_by(unique_mem_id, ever_fed, elig) %>% 
+  mutate(denom = ifelse(length(period_pay[yr_third == ymd('2020-05-01')]) == 0, NA, period_pay[yr_third == ymd('2020-05-01')])) %>% 
+  filter(!is.na(denom)) %>% 
+  mutate(scaled_amount = period_pay/denom) %>% 
+  group_by(yr_third, ever_fed, elig) %>% 
+  summarize(scaled_avg_pay = mean(scaled_amount)) %>%
+  ggplot(aes(x = yr_third, y = scaled_avg_pay, group = ever_fed, color = ever_fed)) +
+  geom_point() +
+  geom_smooth(method = 'lm', formula = y ~ x, se = F) +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  labs(title = "USPS") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ elig, scales = 'free')
+
+
+```
+
+## New First Stage & Parallel Trends
+
+We are primarily concerned with making sure there are parallel trends for the *elig* and *inelig* groups. It would be nice to see parallel trends for the donut and fica group as well. The time interval for this graph is 4 month chunks. The values plotted are weekly average pay during the 4 month chunks (excluding 0s). All groups are indexed to 1 at '2020-05-01' so that that the next value can be interpreted as a percentage increase in average weekly pay. The *federal-elig* group is exactly where we expected it to be with an increase of 7% during the deferral period and an approximately 3% decrease during the next 4 month period.
+
+-   I'm a bit surprised to see that the downturn in the *federal-elig* is so small. I guess enough people got raises at the same time the repayment was extended so that the average weekly payment only reverted to trend instead of going below it.
+-   I think it looks pretty good overall. In the second graph, it's clear that the education groups are driving some of the fluctuations in the trends.
+
+```{r paralleltrends, echo = F}
+# Fed vs. All Other
+payroll %>% 
+  mutate(ever_fed = case_when(employer_type == 'federal' ~ 'federal', TRUE ~ 'other')) %>%
+  filter(employer_type != 'local_educ') %>% 
+  mutate(employer_type = ever_fed) %>% 
+  group_by(unique_mem_id , yr_week_start, employer_type, elig,yr_third) %>% 
+  summarize(period_amt = sum(amount, na.rm = T)) %>% #amount per week
+  group_by(unique_mem_id, employer_type, elig, yr_third) %>% 
+  summarize(avg_period_amt = mean(period_amt, na.rm = T)) %>%  # average weekly pay by treatment period
+  group_by(unique_mem_id, employer_type, elig) %>% 
+  mutate(denom = ifelse(length(avg_period_amt[yr_third == ymd('2020-05-01')]) == 0, NA, avg_period_amt[yr_third == ymd('2020-05-01')])) %>% 
+  filter(!is.na(denom)) %>% 
+  mutate(scaled_avg_pay = avg_period_amt/denom) %>% # normalizing by person
+  group_by(employer_type, elig, yr_third) %>% 
+  summarize(scaled_avg_pay = mean(scaled_avg_pay)) %>% 
+  ggplot(aes(x = yr_third, y = scaled_avg_pay, group = employer_type, color = employer_type)) +
+  geom_line() +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  scale_y_continuous(limits = c(0.8,1.2)) +
+  labs(title = "") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~  elig, scales = 'free')
+```
+
+```{r paralleltrends2, echo = F}
+# Fed. Vs. Granular Categories
+payroll %>% 
+  mutate(ever_fed = case_when(employer_type == 'federal' ~ 'federal', TRUE ~ 'other')) %>%
+  group_by(unique_mem_id , yr_week_start, employer_type, elig,yr_third) %>% 
+  summarize(period_amt = sum(amount, na.rm = T)) %>% #amount per week
+  group_by(unique_mem_id, employer_type, elig, yr_third) %>% 
+  summarize(avg_period_amt = mean(period_amt, na.rm = T)) %>%  # average weekly pay by treatment period
+  group_by(unique_mem_id, employer_type, elig) %>% 
+  mutate(denom = ifelse(length(avg_period_amt[yr_third == ymd('2020-05-01')]) == 0, NA, avg_period_amt[yr_third == ymd('2020-05-01')])) %>% 
+  filter(!is.na(denom)) %>% 
+  mutate(scaled_avg_pay = avg_period_amt/denom) %>% # normalizing by person
+  group_by(employer_type, elig, yr_third) %>% 
+  summarize(scaled_avg_pay = mean(scaled_avg_pay)) %>% 
+  ggplot(aes(x = yr_third, y = scaled_avg_pay, group = employer_type, color = employer_type)) +
+  geom_line() +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  scale_y_continuous(limits = c(0.8,1.2)) +
+  labs(title = "") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~  elig, scales = 'free')
+
+```
+
+### Regressions
+
+All of these are without the USPS (federal_exempt) employees.
+
+```{r reg}
+
+user_history_raw = fread(file.path(proj, "rawdata", "User_History.csv")) 
+
+
+user_history_reg = user_history_raw %>% 
+  filter(elig %in% c('elig', 'inelig') & employer_type_list %in% c('federal', 'state', 'public_univ', 'local', 'local_educ')) %>% 
+  mutate(ever_fed = (employer_type_list == 'federal'), elig = (elig == 'elig'), 
+         date = ymd(paste0(yr_third, "-01")), 
+         deferral = case_when(date < ymd('2020-09-01') ~ "pre",
+                              date >= ymd("2020-09-01") & date <= ymd("2020-12-31") ~ 'deferral',
+                              date >= ymd("2021-01-01") & date <= ymd("2021-12-31") ~ "payback", 
+         TRUE ~ 'post'), 
+         deferral= relevel(as.factor(deferral), ref = 4)) %>% 
+  group_by(unique_mem_id) %>% 
+  mutate(across(c(qual_salary, qual_pay, salary, salary2, total_inflow_minus_transfers, total_inflow),
+                function(x) (x/num_paychecks)/(x[yr_third == '2020-05']/num_paychecks[yr_third == '2020-05']), .names = '{.col}_perpaycheck')) %>% 
+  mutate(across(c(qual_salary, qual_pay, salary, salary2, total_inflow_minus_transfers, total_inflow), function(x) x/x[yr_third == '2020-05'], .names = '{.col}_periodamt')) %>% 
+  mutate(across(c(qual_salary, qual_pay, salary, salary2, total_inflow_minus_transfers, total_inflow), function(x) x - lag(x), .names = '{.col}_levelchange')) %>% 
+  mutate(across(c(housing_cost, mortgage, rent, cc_payments, auto, nondurable, bank_spending, card_spending), function(x) x - lag(x), .names = '{.col}')) %>%
+  mutate(yr_third = relevel(as.factor(yr_third), ref = 6)) 
+
+
+user_history_reg = user_history_reg %>% 
+  group_by(unique_mem_id) %>% 
+  mutate(zero_ind = sum(qual_salary == 0 | salary == 0)) %>% 
+  filter(zero_ind == 0)
+  
+reg_maker <- function(x, formula, string){
+  reg = x %>% 
+  feols(formula, data = .) %>% 
+  summary()
+  
+  output = data.frame(coef_name = names(reg$coefficients), 
+           coef = reg$coefficients,
+           se = reg$se) %>%
+  filter(grepl(string, coef_name)) %>%
+  mutate(date = ymd(paste0(str_sub(coef_name, 20, 26), "-01")))
+  
+  return(output)
+}
+
+formulas <- list(formula(qual_salary_periodamt ~ as.factor(yr_third)*ever_fed*elig), 
+                formula(qual_pay_periodamt~ as.factor(yr_third)*ever_fed*elig), 
+                formula(salary_periodamt~ as.factor(yr_third)*ever_fed*elig),
+                formula(salary2_periodamt~ as.factor(yr_third)*ever_fed*elig),
+                formula(total_inflow_minus_transfers_periodamt~ as.factor(yr_third)*ever_fed*elig),
+                formula(total_inflow_periodamt ~ as.factor(yr_third)*ever_fed*elig),
+                formula(qual_salary_perpaycheck ~ as.factor(yr_third)*ever_fed*elig), 
+                formula(qual_pay_perpaycheck ~ as.factor(yr_third)*ever_fed*elig), 
+                formula(salary_perpaycheck ~ as.factor(yr_third)*ever_fed*elig),
+                formula(salary2_perpaycheck ~ as.factor(yr_third)*ever_fed*elig),
+                formula(total_inflow_minus_transfers_perpaycheck~ as.factor(yr_third)*ever_fed*elig),
+                formula(total_inflow_perpaycheck~ as.factor(yr_third)*ever_fed*elig),
+                formula(qual_salary_levelchange ~ as.factor(yr_third)*ever_fed*elig), 
+                formula(qual_pay_levelchange ~ as.factor(yr_third)*ever_fed*elig), 
+                formula(salary_levelchange ~ as.factor(yr_third)*ever_fed*elig) ,
+                formula(salary2_levelchange ~ as.factor(yr_third)*ever_fed*elig) ,
+                formula(total_inflow_minus_transfers_levelchange~ as.factor(yr_third)*ever_fed*elig) ,
+                formula(total_inflow_levelchange~ as.factor(yr_third)*ever_fed*elig) )
+regs = lapply(formulas, reg_maker, x= user_history_reg, string = ":ever_fedTRUE:eligTRUE") %>% 
+  bind_rows(.id = 'reg') %>% 
+  mutate(per_paycheck = case_when(as.numeric(reg) <= 6 ~ 'periodamt', 
+                                as.numeric(reg) > 6 & as.numeric(reg) <= 12 ~ 'perpaycheck', 
+                                as.numeric(reg) > 12 ~ 'levelchange'),
+          reg = as.numeric(reg) %% 6) %>%  
+  mutate(reg = case_when(reg == 1 ~ "qual_salary", reg == 2 ~ "qual_pay",
+                         reg == 3 ~ "salary", reg == 4 ~ "salary2", 
+                         reg == 5 ~ "total_inflow_minus_transfers", reg == 0 ~ 'total_inflow'))
+
+regs %>% 
+  filter(reg == 'qual_pay' ) %>% 
+  ggplot(aes(x = date, ymin = coef - 1.96*se, ymax = coef + 1.96*se)) +
+  geom_point(aes(x = date, y = coef, color = reg), position = position_dodge(width = 75)) +
+  geom_errorbar(aes(color = reg), position = position_dodge(width = 75)) +
+  geom_hline(yintercept = 0, color = 'black') +
+  labs(title = "Time Coefficients on Yr_Third*Federal*Eligible") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ per_paycheck, scales = 'free', ncol = 2)
+
+
+regs %>% 
+  filter(reg == 'qual_pay' ) %>% 
+  ggplot(aes(x = date, ymin = coef - 1.96*se, ymax = coef + 1.96*se)) +
+  geom_point(aes(x = date, y = coef, color = reg), position = position_dodge(width = 75)) +
+  geom_errorbar(aes(color = reg), position = position_dodge(width = 75)) +
+  geom_hline(yintercept = 0, color = 'black') +
+  labs(title = "Time Coefficients on Yr_Third*Federal*Eligible") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ per_paycheck, scales = 'free', ncol = 2)
+
+
+```
+
+
+
+```{r onewayelig}
+
+#comparing Eligible to Eligible
+onewayelig_regs = lapply(formulas, reg_maker, x= user_history_reg %>% filter(elig == TRUE), string = ":ever_fedTRUE") %>% 
+  bind_rows(.id = 'reg') %>% 
+  mutate(per_paycheck = case_when(as.numeric(reg) <= 6 ~ 'periodamt', 
+                                as.numeric(reg) > 6 & as.numeric(reg) <= 12 ~ 'perpaycheck', 
+                                as.numeric(reg) > 12 ~ 'levelchange'),
+          reg = as.numeric(reg) %% 6) %>%  
+  mutate(reg = case_when(reg == 1 ~ "qual_salary", reg == 2 ~ "qual_pay",
+                         reg == 3 ~ "salary", reg == 4 ~ "salary2", 
+                         reg == 5 ~ "total_inflow_minus_transfers", reg == 0 ~ 'total_inflow'))
+
+onewayelig_regs %>% 
+  #filter(reg == 'qual_salary' | reg == 'qual_pay' | reg == 'total_inflow_minus_transfers')%>% 
+  ggplot(aes(x = date, ymin = coef - 1.96*se, ymax = coef + 1.96*se)) +
+  geom_point(aes(x = date, y = coef, color = reg), position = position_dodge(width = 75)) +
+  geom_errorbar(aes(color = reg), position = position_dodge(width = 75)) +
+  geom_hline(yintercept = 0, color = 'black') +
+  labs(title = "Time Coefficients on Yr_Third*Federal") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ per_paycheck, scales = 'free', ncol = 2)
+
+
+```
+
+
+
+```{r onewayfed}
+
+#comparing fed-elig to fed-inelig
+onewayfed_regs = lapply(formulas, reg_maker, x= user_history_reg %>% filter(ever_fed == TRUE), string = ":eligTRUE") %>% 
+  bind_rows(.id = 'reg') %>% 
+  mutate(per_paycheck = case_when(as.numeric(reg) <= 6 ~ 'periodamt', 
+                                as.numeric(reg) > 6 & as.numeric(reg) <= 12 ~ 'perpaycheck', 
+                                as.numeric(reg) > 12 ~ 'levelchange'),
+          reg = as.numeric(reg) %% 6) %>%  
+  mutate(reg = case_when(reg == 1 ~ "qual_salary", reg == 2 ~ "qual_pay",
+                         reg == 3 ~ "salary", reg == 4 ~ "salary2", 
+                         reg == 5 ~ "total_inflow_minus_transfers", reg == 0 ~ 'total_inflow'))
+
+onewayfed_regs %>% 
+  #filter(reg == 'qual_pay' |reg == 'qual_salary' | reg == 'total_inflow_minus_transfers')%>% 
+  ggplot(aes(x = date, ymin = coef - 1.96*se, ymax = coef + 1.96*se)) +
+  geom_point(aes(x = date, y = coef, color = reg), position = position_dodge(width = 75)) +
+  geom_errorbar(aes(color = reg), position = position_dodge(width = 75)) +
+  geom_hline(yintercept = 0, color = 'black') +
+  labs(title = "Time Coefficients on Yr_Third*Elig") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ per_paycheck, scales = 'free', ncol = 2)
+
+```
+
+
+```{r inflowcategories}
+
+inflow_categories = fread(file.path(proj, 'rawdata', "Category_Distribution_among_Inflows.csv"))
+
+inflow_categories[inflow_categories == 0] <- ""
+
+inflow_categories %>% 
+  kable() %>% 
+  kable_styling() %>% 
+  row_spec(c(0), bold = T, hline_after = T)
+
+```
+
+```{r expenditure_categories}
+
+expenditure_categories = fread(file.path(proj, "rawdata", "expenditure_categories.csv"))
+
+expenditure_categories %>% 
+  kable() %>% 
+  kable_styling() %>% 
+  row_spec(c(0), bold = T, hline_after = T)
+
+```
+
+Played around with all sorts of different versions of expenditures (percent changes, levels, etc.) ... they all seem to have very wide confidence intervals. Tell me more about how you think winsorizing would work in this situation.
+
+```{r expenditure}
+
+
+lapply(list(formula(housing_cost ~ as.factor(yr_third)*ever_fed*elig),
+            formula(mortgage ~ as.factor(yr_third)*ever_fed*elig),
+            formula(rent ~ as.factor(yr_third)*ever_fed*elig),
+            formula(cc_payments ~ as.factor(yr_third)*ever_fed*elig),
+            formula(auto ~ as.factor(yr_third)*ever_fed*elig),
+            formula(nondurable ~ as.factor(yr_third)*ever_fed*elig),
+            formula(bank_spending ~ as.factor(yr_third)*ever_fed*elig),
+            formula(card_spending ~ as.factor(yr_third)*ever_fed*elig),
+            formula(total_outflow ~ as.factor(yr_third)*ever_fed*elig)
+            ),
+       reg_maker, x = user_history_reg,  string = ":ever_fedTRUE:eligTRUE") %>% 
+  bind_rows(.id = 'reg') %>% 
+  mutate(reg = case_when(reg == 1 ~ "housing", reg == 2 ~ 'mortgage',
+                         reg == 3 ~ "rent", 
+                         reg == 4 ~ "cc_payments", reg == 5 ~ "auto", 
+                         reg == 6 ~ "nondurable", reg == 7 ~ 'bank_spending', reg == 8 ~ 'card_spending', reg == 9 ~'total_outflow')) %>% 
+  filter(reg != 9) %>% 
+  ggplot(aes(x = date, ymin = coef - 1.96*se, ymax = coef + 1.96*se)) +
+  geom_point(aes(x = date, y = coef, color = reg), position = position_dodge(width = 75)) +
+  geom_errorbar(aes(color = reg), position = position_dodge(width = 75)) +
+  geom_hline(yintercept = 0, color = 'black') +
+  labs(title = "Time Coefficients on Yr_Third*Federal*Eligible") +
+  theme_bw() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(.~ reg, scales = 'free')
+
+
+```
+
+## Covariate Analysis
+
+
+### Mobility
+
+After receiving feedback from Scott on the measure of mobility, I've updated the definitions to:
+
+* preperiod_geo: most common geography from 2020-01 to 2020-06 (inclusive). 
+* postperiod_geo: most common geography from 2021-06 to 2022-01 (inclusive).
+* moved: (indicator) for preperiod_geo $\neq$ postperiod_geo
+
+Hopefully, this cuts down on the noise in the Yodlee's geography measures.
+
+```{r cov}
+
+user_history_raw %>% 
+  mutate(ever_fed = case_when(employer_type_list == 'federal' ~ 'federal', TRUE ~ 'other')) %>% 
+  group_by(unique_mem_id, ever_fed, elig) %>% 
+  summarize_at(vars(c(move_state, move_city, dc_area_pre)), first) %>% 
+  group_by(ever_fed, elig) %>% 
+  summarize_at(vars(c(move_state, move_city, dc_area_pre)), mean, na.rm = T) %>% 
+  kable()
+```
+
+
+
+
+```{r moves_by_month}
+
+moves_by_month = fread(file.path(proj, 'rawdata', 'Moves_By_Month.csv')) %>% 
+  filter(start_date != ymd('2018-09-02'))
+
+moves_by_month  %>% 
+  ggplot(aes(x = start_date, y = perc_move )) +
+  geom_bar(stat = 'identity', fill = 'steelblue', color = 'black') +
+  geom_hline(yintercept = mean(moves_by_month$perc_move)) +
+  geom_text(aes(ymd('2019-11-02'), mean(moves_by_month$perc_move),label = "Period Avg", vjust = -1)) +
+  labs(title = '"Moves" between States By Month', x = 'date') +
+  theme_bw() +
+  theme(plot.title =element_text(hjust = 0.5))
+
+```
+
+I created the previous graph to show just how volatile Yodlee's geographic assignments are. They have an overall moving rate of `r mean(moves_by_month$perc_move)` per month which is obviously way too high. It should be around 1-2% per month, and I'm not sure the dramatic increase in changes in geographies (i.e. "moves") matches actual moving data. At least the summer seasonal spike is present which matches reality. Also worth noting is that roughly 10% of the geo observations are not spaced one month apart. So beware of this fact when doing a month-over-month measure in the geography data. 
+
+-   UI Payments, overdraft fees, balance snapshot, length of time in the dataset
+-   Worth linking to home price indices for those with mortgage payments (home prices were incredibly volatile during this time period) We could use percentile ranking of property tax payments in the same city as a proxy for home value since levy rate is usually stable within a city.
+-   How should we think about 401k contributions/retirement plans since we don't see most of the activity? We do not know how much they are contributing pre-tax, and we don't necessarily see what type of account money is transfered from if it is indeed transfered. 
+-   How should we think about contemporaneous wealth effects due to retirement accounts/401k/housing? Not a problem econometrically unless there is endogeneity in location, home ownership, etc.
+-   We can probably come up with a way to identify refinances, maybe even distinguish between cash out and rate refi (i.e. no change of city in geo, no uhaul or mover transactions, significant change in mortgage amount (but still positive to avoid picking up defaulters), )
+-   Looked at CPS, SCF, and SIPP to see what we can benchmark our data too (will have more on that shortly)

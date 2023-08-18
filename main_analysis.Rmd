@@ -2,20 +2,19 @@
 title: "Main Analysis"
 author: "William Lee"
 date: "`r Sys.Date()`"
+toc: yes
 output: 
-  pdf_document:
-  toc: true
-  toc_depth: 3
+  pdf_document
 ---
 
 ```{r setup, include=FALSE, warning = FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = FALSE)
 
 rm(list = ls())
 
 
 xfun::pkg_attach2('tidyverse', 'readxl', 'stats', 'sandwich', 'lmtest', 'ivreg', 'knitr', 
-                  'lubridate', 'data.table', 'kableExtra', 'rJava', 'RJDBC', 'fixest')
+                  'lubridate', 'data.table', 'kableExtra', 'rJava', 'RJDBC', 'fixest', 'kableExtra')
 
 options(dplyr.summarise.inform = FALSE)
 
@@ -29,12 +28,53 @@ proj <- dirname(rstudioapi::getSourceEditorContext()$path)
 
 ## Introdution
 
-The following is the second document in a series analyzing the 2020 Payroll Tax Deferral Program. In the first document, titled "User_Count", I proposed a classification scheme to determine which workers are eligible for the tax deferral and discussed limitations of the data. This document present preliminary results on the payroll tax deferral.  
+The following is the second document in a series analyzing the 2020 Payroll Tax Deferral Program. In the first document, titled "User_Count", I proposed a classification scheme to determine which workers are eligible for the tax deferral and discussed limitations of the data. Scott and I used the data presented in User_Count to help craft our definition for eligibility and federal worker status, but I haven't updated that document to reflect our recent changes since it would be cumbersome. However, the discussion and distribution charts of certain variables might be useful for future reference.  
+
+## Recap of Prior Results
 
 
-I'm working with the full set of restrictions on who is counted as an eligible federal employee. The number of individuals is small here (1497 federal-eligible, 200 federal-ineligible, 129-state/local eligible, 6 state/local ineligible ). Even with the very restrictive definition, some of the key variables like paycheck frequency and amount show a high amount of variability. 
+
+### Definition of Federal Worker/Eligibilty
+
+Since we are not able to directly observe whether or not a given user was eligible/enrolled in the Payroll Tax Deferment, we have to infer eligibility from the transaction data and refine our sample so that we have high-quality treatment and control groups. So far, we are working under the assumption that an eligible federal worker is one who:
+
+1. Has an average Yodlee Score of at least 6.5 from August 2019 - Dec 2022. (This is Yodlee's suggested value for a 'stable' user.)
+1. Has qualifying payment observations (based on description, primary_merchant, and amount fields).^[transaction must be greater than \$500, from an identified vendor, marked as Salary/Regular Income by Yodlee and not marked as a duplicate transaction]
+1. Observe no more than 20% of total inflows from other sources of income (i.e. SSI, Venmo transactions, transfers from other accounts, investment income)
+1. Has qualifying payment observations from a single employer at regular intervals (weekly, biweekly, or monthly) from Jan 2020 to Jan 2022.
+1. Makes between \$2,500 - \$8666.67 per month (\$1,153.85  - \$4,000 for biweekly). We rule out individuals making too little as they are unlikely to be engaged in stable, full-time work. (Consider lowering the upper threshold by a certain amount to account for typical withholding). Also, the individual must make no more than the annual FICA limit. 
+1. Observe no more than 35% volatility between paychecks to rule out employees with varying hours worked,travel reimbursements,etc.
+1. Be able to link all between 80-120% of credit card payments that leave an individual's bank accounts to equivalent balance reductions in the individual's card accounts. Otherwise, we will not be observe debt-funded consumption. (80% = we are probably missing a bank account or there is a joint account elsewhere paying it down, 120% = we are probably missing a credit card).
+
+A state/local employee, will match the exact same definition but with a qualifying state/local string.
+
+### Waterfall Table
+
+**Filter Level** | **Number of Individuals**
+----- | -----
+Initial 5% Sample | 1,242,461 
+Filter 1: User Score | 1,163,164
+Filter 2: Qualifying Strings | 76,641
+Filter 3: Single Employer, Number of Observations | 71,747
+Filter 4: Outside Income Restriction | 30,805
+Filter 5: Paycheck Volatility | 11,127
+Filter 6: Income Eligibility | 9,892
+Filter 7: Card Linkage | 1,832
 
 
+* Next round will update this table for individuals who go over the FICA limit and should be excluded. For now, they are just marked ineligible. 
+* Big drop off on qualifying strings -- suggests there may be more strings lurking in the data (6% individuals retained but 15% work for some sort of government)
+* Outside income, paycheck volatility, and card linkage are the most restrictive pieces. What are the downsides to loosening the definitions?
+
+
+### Challenges and Current Efforts
+
+* Inherent tradeoff between restrictions on inclusion in the sample and sample size (likely not a problem when I improve the string search for state/local).Results presented today don't include public university, public hospital, or school system employees. 
+* The easiest federal transactions to find are the military, which are unfortunately the least comparable to the state/local employees.
+* Missing many state employees because the payroll strings for states are not super obvious (IDHS instead of ILLINOIS DEPT OF HEALTH AND SAFETY), and it looks like some states also pay contractors through their state treasury accounts. I need to continue searching state by state to make sure each state is truly payroll and not benefits, commercial billing, or other expenditures. 
+* Numbers for state employees will hopefully go up when I add state university systems and maybe some hospital systems. 
+* Missing many local employees because they use irregular strings (i.e. MWRD instead of Metropolitan Water Reclamation District) and have high paycheck volatility. Most cities have firefighters/police/teachers being their main labor expenditure and all of those will have significant volatility due to schedules, overtime, and holidays. 
+* Both state/local don't seem to have many employees making over 104k/year in direct wages which makes it very hard to find enough of them (will need to expand random sample size for the next update). 
 
 ```{r load, echo = F}
 file.paths <- list(file.path(proj, 'rawdata', 'finalp1.csv'),
@@ -47,18 +87,42 @@ final <- lapply(file.paths, fread) %>%
   mutate(optimized_transaction_date = ymd(optimized_transaction_date), 
          day_of_week = weekdays(optimized_transaction_date),
          yr_mon = lubridate::round_date(optimized_transaction_date, unit = 'month'),
-         yr_week = paste0(lubridate::year(optimized_transaction_date), lubridate::isoweek(optimized_transaction_date)) ,
          yr_week_start = lubridate::round_date(optimized_transaction_date, unit = 'week', week_start = 1)) %>% 
   mutate(fed_elig = paste0(ever_fed, "-", elig)) %>% 
   mutate(deferral = case_when(optimized_transaction_date < ymd("2020-09-01") ~ 'pre', 
                               optimized_transaction_date >= ymd("2020-09-01") & optimized_transaction_date <= ymd("2020-12-31") ~ 'deferral',
                               optimized_transaction_date >= ymd("2021-01-01") & optimized_transaction_date <= ymd("2021-12-31") ~ "payback", 
-         TRUE ~ 'post')) 
+         TRUE ~ 'post')) %>% 
+  filter(primary_merchant_name != "USPS")
 
 
 ```
 
+### Data Description 
 
+The data presented in this document works on a 5% random sample of the Yodlee data. 
+
+
+**Variable** | **Definition** 
+---------|-------------
+median_pay_freq | Median number of days between government paychecks (marked as Salary/Regular Income, qualifying pattern, over \$500)
+n_paychecks | Number of paychecks from Sept 2019 to Aug 2022
+paycheck_vol | sd(paycheck_amount)/mean(paycheck_amount)
+annual_income | Income From Sept 2019 - Aug 2020, used to determine eligibility for the deferral
+monthly_income | Income From Aug 2020, used to determine eligibility for the deferral
+elig | Indicator for eligibility (elig = TRUE if annual_income < 104k and monthly_income*12 < 104k) and below annual FICA limit
+paydown_from_bank | Amount of money leaving all the bank accounts of an indiv. marked as "Credit Card Payments"
+paydown_from_card | Amount of money entering the card accounts of an indiv. marked as "Credit Card Payments"
+calc_perc_observed| Percentage of Credit Card Payments that are observed as credit in the credit file after leaving the bank account (100 = perfect observation, < 100 : possibly missing card accounts, > 100: possibly missing bank accounts)
+total_income | total amount of credits in the bank file marked as ('Interest Income', 'Other Income', 'Salary/Regular Income','Sales/Services Income')
+qualifying_income | total amount of credits in the bank file that 1) have a qualifying pattern, 2) amount > 500 3) marked as Salary/Regular Income
+gov_income_ratio | qualifying_income*100/total_income
+fed | Categorical (federal, state, local ) if transaction is a qualifying transaction
+ever_fed | Indicator = 1 if individual ever was a federal employee
+day_of_week | Day of the week based on optimized_transaction_date
+yr_week_start | YYYY-DDMM for each monday of the week
+fed_elig | ever_fed + elig (essentially defines the 2x2 grid)
+deferral | (pre, deferral, payback, post) where payback is Jan 2021 - Dec 2021
 
 
 
@@ -89,56 +153,39 @@ moneyshot(final, yr_week_start, "")
 
 ```
 
-## Analysis By Employer
+## Data Discussion Topics
 
-* OPM doesn't seem eligible
-* USPS doesn't seem eligible
-* Why is government of Canada in here?
+### Analysis By Employer
+
+* OPM and USPS look ineligible, so they have been removed for the future
+* Not sure about USCG
+* Some small federal employers (ex. Bonneville Power Administration) were eligible. Easy to overlook small federal employers so will need to be careful
+* Canadian data is unfortunately in here... need to remove
 * Pattern for treasury doesn't seem very strong
 * Even with very strict volatility restriction, the payments seem all over the place
 * DFAS has the clearest trend
 * Very few state/local employees survived the thresholds
 
-```{r employer, echo = F}
+```{r employer, eval = F}
 
-fed_employers <- final %>% filter(ever_fed == 'federal' & fed != '') %>% 
-  select(primary_merchant_name) %>% pull(.) %>% unique(.)
+fed_employers <- c("U.S. Department Of The Treasury", "DFAS", "United States Coast Guard", "Bonneville Power Administration")
 
-other_employers <- c("City Of New York", "City Of Chicago", "Commonwealth of Pennsylvania", "State Of Florida", "City of Houston")
+other_employers <- c("City Of New York", "Commonwealth of Pennsylvania", "State Of California", "Anne Arundel County Board")
 
-lapply(fed_employers, function(x) moneyshot(final %>% filter(primary_merchant_name == x ), yr_week_start, x))
-lapply(other_employers, function(x) moneyshot(final %>% filter(primary_merchant_name == x ), yr_week_start, x))
-
-```
-
-
-```{r indiv, echo = F}
-
-sample_ids <- final %>% filter( paycheck_vol < 10) %>% 
-  select(unique_mem_id) %>% pull(.) %>% sample(., 40)
-
-final %>% 
-  filter(fed != '' & unique_mem_id %in% sample_ids) %>% 
-  group_by(unique_mem_id) %>% 
-  mutate(scaled_amount = amount/mean(amount, na.rm = T)) %>% 
-  group_split(unique_mem_id) %>% 
-  map(~ ggplot(.,aes(x = optimized_transaction_date, y = scaled_amount)) +
-  geom_point() +
-  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
-  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
-  labs(title = paste0(.$primary_merchant_name, "-", .$ever_fed, "-", .$elig)) +
-  theme_bw() +
-  theme(plot.title = element_text(hjust = 0.5)))
-
+lapply(fed_employers, function(x) moneyshot(final %>% filter(primary_merchant_name == x ) %>% mutate(elig = ""), yr_week_start, x))
+lapply(other_employers, function(x) moneyshot(final %>% filter(primary_merchant_name == x) %>% mutate(elig = ""), yr_week_start, x))
 
 
 
 ```
 
 
-## Salary Vs Government Income
 
-Even with the restriction on outside earnings (no more than 20% of total earnings), the desired effect becomes more muddled. I think it's reasonable to conclude that Salary/Regular Income is not actually a very good measure of earned wages. There are a bunch of transactions that look like benefits (small DFAS payments, child support).
+
+
+### Salary Vs Government Income
+
+Even with the restriction on outside earnings (no more than 20% of total earnings), the desired effect becomes more muddled. I think it's reasonable to conclude that Salary/Regular Income is not actually a very good measure of earned wages. There are a bunch of transactions that look like benefits (small DFAS payments, child support). After discussing with Scott, we think it's best to focus purely on transactions greater than \$500 as those are likely to be true earned wages and we Type I errors are far more destructive here than Type II errors. 
 
 ```{r sav_v_gov, echo = F}
 
@@ -161,24 +208,75 @@ Even with the restriction on outside earnings (no more than 20% of total earning
 
 ```
 
+### Partial Weeks and Cohorts
 
+One challenge Scott and I have already noticed is that we will need to be very precise on determining the first/last treated paychecks. In the graph below, you can see that most employees are on the standard pay cycles (biweekly = every 14 days, bimonthly = every 15/16 days, monthly = every 30/31 days). Essentially, I need to sort each individual into the appropriate 'cohort' and determine which paychecks are treated. At some point, we will have to decide if treatment begins on September 1st, first paycheck after September 1st (even if partial), or first full paycheck after September 1st and then a similar decision for the end of treatment. 
+The end of treatment in January is even more sinister as that is when individuals are most likely to receive holiday overtime/pay raises/new healthcare plans/new state tax rates go into effect. I would love for guidance on this!
+
+```{r payfreq, echo = F}
+
+final %>% 
+  group_by(unique_mem_id) %>% 
+  summarize(median_pay_freq = first(median_pay_freq)) %>% 
+  ggplot(aes(x = median_pay_freq)) +
+  geom_histogram(bins = 31, color = 'black', fill = 'steelblue') +
+  labs(title = "Median Pay Frequency of Individuals", x= '# Days' ) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+### Manual Inspection of Selected Individuals 
+
+
+I pulled a few strategic individual examples to highlight the shortcomings of the current classification scheme. 
+
+* Significant paycheck variability even for people with single incomes over long periods with the same employer. 
+* Sometimes "inelig" federal employees seem to be getting the deferral. (first graph) Am I wrong or did they do the payroll incorrectly? It looks like the spike occurs even before September. 
+* DFAS has the clearest results but not always perfect
+* City workers have a lot of small spikes which is probably why so many got weeded out in the paycheck_volatility round. I suppose this makes sense for firefighters/police/teachers or anybody who might receive large amounts of holiday pay or reimbursements. 
+* Some OPM seems not to be treated. How did OPM avoid being treated? Surely they qualify as a federal branch.
+* Some have their spike in the first paycheck of the treated period (#9), some the second (#6, #8), some stairstep (#4). 
+
+```{r indiv, echo = F}
+
+sample_ids2 <- c("529143094349417319729902", "1165744437294697187873604", 
+                 "398425119760644634114402", "772165833332448899387103",
+                 "246423256630977696914800",  "391647293558185906836204",
+                 "451796715302611302065003", "857264753486073470622704",
+                  "560409494246881429972304")
+
+final %>% 
+  filter(fed != '' & unique_mem_id %in% sample_ids2) %>% 
+  group_by(unique_mem_id) %>% 
+  mutate(scaled_amount = amount/mean(amount, na.rm = T)) %>% 
+  group_split(unique_mem_id) %>% 
+  map(~ ggplot(.,aes(x = optimized_transaction_date, y = scaled_amount)) +
+  geom_point() +
+  geom_vline(xintercept = ymd('2020-09-01'), color = 'black') +
+  geom_vline(xintercept = ymd('2021-01-01'), color = 'black') +
+  labs(title = paste0(.$primary_merchant_name, "-", .$ever_fed, "-", .$elig, "-", .$unique_mem_id)) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)))
+
+
+
+
+```
 
 ## Format of Regressions
 
-* Increase in coefficients during the treatment period (yay!)
-* No decrease in January (is it bc of pay raises that differ from state/federal)
-* Coefficients too large in my opinion (should be like .5-.1)
-* Are we sure that state/federal workers generally have the same trends in general? Perhaps check with some panel data with granular employment data
+Even though the sample size is far too small to even begin to rely on these results, I figured I would include the type of regression that I intend to run in the near future on the data to get our feedback.
+
+We expect to see a statistically significant 
 
 $$ weeklypay_t = week_t + \beta_t*week_t*federal + \gamma_t*week_t*eligible + \delta_t*week*federal*eligible $$
 
 
 where the variable of interest are the weekly $\delta_t$. 
 
-```{r regs, echo = T}
-
-
-
+```{r regs, echo = F}
 fes <- final %>% 
   mutate(ever_fed = factor(ever_fed, levels = c('other', 'federal')),
          elig = factor(elig, levels = c('inelig', 'elig'))) %>% 
@@ -202,9 +300,10 @@ data.frame(coef = summary(fes)$coefficients[479:636],
   labs(title = "Weekly Time Coefficients on Week*Federal*Eligible") +
   theme_bw() +
   theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5))
+```
 
 
-
+```{r regs2, echo = F, eval = F}
 fes2 <- final %>% 
   mutate(ever_fed = factor(ever_fed, levels = c('other', 'federal')),
          elig = factor(elig, levels = c('inelig', 'elig'))) %>% 
@@ -232,12 +331,24 @@ data.frame(coef = summary(fes)$coefficients[113:149],
 
 ```
 
+
+
+
 ## Early Covariate Analysis
 
-This is just the start of what I will show you. I'm going to rerun on the larger sample and craft a cleaner version of displaying the results. 
+I haven't had enough time to fully build up the covariate analysis, so I'll just list some preliminary results and propose a set of covariates that you can add/subtract from as you please. First, a simple chart showing the number of observations and duration of observation. The "eligible" individuals are poorer and therefore have slightly fewer observations, but it doesn't seem that there is much selection on presence in the Yodlee data. 
 
-```{r covariate, echo = F}
+```{r covariate1, echo = F, eval= T}
+kable(read.table(text = "ever_fed,elig,unique_mem_id,avg_observations,days_before,days_after,avg_range
+other,elig,129,6836,2768,703,3471
+federal,inelig,200,8160,3067,706,3774
+federal,elig,1497,7769,2709,707,3417
+other,inelig,6,8775,3131,688,3819
+", sep = ",", header = T))
+```
+Second, is a simple graph to show the the average amount spent/earned per Yodlee transaction category by fed_elig status per month in the pre/deferral/payback/post periods. Again, these values aren't very meaningful at the moment, they do show that the federal and state/local employees are roughly comparable in their spending/earning habits. By the next update, I will have these figures for a much larger sample size and have a more logical grouping of the transaction categories. 
 
+```{r covariate2, echo = F}
 
 transaction_categories <- final %>% count(transaction_category_name) %>% arrange(desc(n)) %>% slice(1:15) %>% select(transaction_category_name) %>% pull(.)
 
@@ -257,23 +368,45 @@ final %>%
   facet_wrap(.~ deferral) 
 
 
-read.table(text = "ever_fed,elig,count,avg_observations,days_before,days_after,avg_range
-other,elig,129,6836,2768,703,3471
-federal,inelig,200,8160,3067,706,3774
-federal,elig,1497,7769,2709,707,3417
-other,inelig,6,8775,3131,688,3819
-", sep = ",", header = T)
-
 ```
+
+The following table describes the covariates worth considering (when I'm able to get around to constructing them). I included some measures of financial well-being, leverage, and past earning volatility. We could benchmark these figures against SCF/SIPP data to show how federal/state/local employees compare to the broader population - could be useful for discussing the external validity of our results. 
+
+**Variable** | **Description**
+------- | -------
+major_metro | Indicator for NYC, SF, DC, CHI, etc. CBSA's
+starting_bank_balance | still working on how to compute bank/card balance, maybe just change in balance from a certain date
+starting_card_balance | 
+housing_cost | rent/mortgage payment
+debt_service | amount of loan payments in the Mortgage + Loans categories as a fraction of income
+past_ui | total amount of UI payments from a certain date^[UI strings from this [link]( https://view.officeapps.live.com/op/view.aspx?src=https%3A%2F%2Fwabankers.com%2Fuserfiles%2Fuploads%2FState_UI_ACH_ID_List.xlsx&wdOrigin=BROWSELINK) and this [link](https://www.neach.org/Solutions/COVID-19-Information/Unemployment-Payments)]
+past_overdraft | amount of overdraft fees
+past_cc_utilization | credit card utilization as a fraction of current income
+number_accounts | number of bank accounts and credit accounts associated with the unique_mem_id
+
+
+
+
+## Questions for Adam (or others)
+1. **Beginning of Year Pay Increases** It looks like most federal workers get their pay raises in January (and some in July). How should we account for the pay raise in our study, especially since state/local workers will not be receiving the same size of increase and state/local workers might be on a different pay cycle (for example, education budgets might operate based on the school year). How far in advance do the federal workers know about their future raises?
+1. **Small Transactions** I noticed that there are a lot of transactions that match our string/merchant pattern but are too small to be a paycheck. I'm guessing they might be military housing benefits, retirement benefit, or miscellaneous employee benefit. Example (FED PAYMNT from US Treasury or DFAS RES PAY from DFAS).
+1. **Announcement Effects** Not urgent right now, but eventually we will want to know exactly when the employees knew about the program and when they knew the timeline for the repayments, especially since it sounds like the repayment horizon was unexpectedly extended.
+1. **General Info on Withholdings** Scott seems pretty confident that FICA taxes are applied until the annual ceiling is breached, so our upper income employees will appear to get a pay raise late into the year. Is this correct? (not doubting Scott, just want to be sure).
+1. **General Withholding2** What is the typical withholding amount? Probably in the 15-20% range, correct? This is probably even higher for employees who pay D.C. income tax (another 4-6%). What should the thresholds be to make sure we do not get any false-positives (i.e. an inidivual making 110k but taking an abnormally high deduction and therefore appears eligible)?
+1. **Partial Weeks into the Deferral Period** How would an employee on a monthly pay cycle starting on the 15th of each month experience the deferral? Is a partial deferral applied based on the fraction of the paycycle into the deferral period? I suppose we can try to discern by looking at the individual panel of payments.
+1. **Is Eligibility Static**  For example, if you receive a scheduled pay raise in October 2020 that puts you above the threshold, do you still participate in the program?)
+
 
 ## To-Do
 
-* Find more state workers
-* Download larger sample size and rerun results
-* Treat first paycheck in the deferral period as partly treated??
-* Find out more about how federal workers get their salary increases in Jan 2023 (is it the same for everybody?). What's the process for state workers?
-* More covariates (overdraft, unemployment, geography, etc. )
+1. Incorporate Feedback into Results
+1. Review Code for errors before adding new results
+1. Look for more state/local workers. Manually inpsect the largest employers to make sure we aren't including fines/retirement benefits/etc. 
+1. Add FICA limits as ceiling for all workers
+1. Partial weeks/cohorts per Adam's answers
+1. (If free time before next update) build up balance variables and control variables. 
 
-## Questions for Adam
-1. **Beginning of Year Pay Increases** It looks like most federal workers get their pay raises in January. How should we account for the pay raise in our study, especially since state/local workers will not be receiving the same size of increase and state/local workers might be on a different pay cycle (for example, teachers get their pay raises at the beginning of the school year). 
-1. How far in advance do the federal workers know about their future raises?
+
+## Housekeeping
+
+You can find my code and outputs on my personal github page (https://github.com/WilliamHLee104/PayrollTax)[https://github.com/WilliamHLee104/PayrollTax]. I will update my files on the Dropbox at the end of every week, but I like the functionality of git. 
